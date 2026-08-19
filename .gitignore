@@ -1,0 +1,26 @@
+# Python önbellek dosyaları
+__pycache__/
+*.pyc
+
+# Veritabanı ve Otomatik Raporlar
+*.db
+*.csv
+
+# Editör klasörleri
+.vscode/
+.idea/venv/
+venv/
+
+# C++ derleme ara çıktıları (CMake junk)
+backend/build/
+*.o
+
+# NOT: backend/sdr_core.so donanımla kutudan çıktığı gibi çalışabilsin diye
+# bilerek depoda TUTULUR (takipten çıkarılmaz). Kendi ortamında yeniden
+# derlersen bu dosyanın üzerine yazılır — sorun değildir.
+
+# Ham IQ dökümleri ve veri klasörü
+data/
+raw_iq_dump_*.npy
+proje-inceleme.zip
+sdr_kod.txt

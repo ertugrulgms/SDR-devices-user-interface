@@ -1,0 +1,1578 @@
+import time
+import numpy as np
+import socket
+import threading
+import json
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from backend.dsp_processor import DSPProcessor, DFAccuracyTracker, NoiseFloorTracker
+from backend.jamming_generator import JammingGenerator
+from backend.gnss_spoofer import GNSSSpoofer
+from backend.mission_logger import MissionLogger  # <-- LOGLAYICI EKLENDİ
+from backend.hardware_controller import HardwareController
+from backend.audio_demodulator import AudioDemodulator, StreamingDemodulator
+from backend.digital_voice import classify_fm_or_fsk
+from backend.signal_monitor import SignalMonitor
+from backend.gps_receiver import GPSReceiver
+from backend.geo import geodetic_to_enu
+from backend.signal_classifier import SignalClassifier, HoppingHistoryTracker
+from backend.tx_engine import TxWaveformBuilder, WIFI_BAND_CENTERS, WAV_DECEPTION_WAVE
+from backend.audio_deception import load_wav_mono
+from backend.direction_finding import (NodeBearingStore, AmplitudeDFEstimator, azel_to_unit,
+                                       triangulate_lob, bearing_from_positions,
+                                       load_node_registry, self_node_id, MovingReceiverPositioner)
+
+# --- SOAPYSDR DONANIM KÜTÜPHANESİ KONTROLÜ ---
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__)))
+
+try:
+    import sdr_core
+    SOAPY_AVAILABLE = True
+except ImportError:
+    SOAPY_AVAILABLE = False
+
+# --- SABİTLER (bulgu #13: sihirli sayılar isimlendirildi) ---
+FFT_POINTS = 2048
+UPDATE_INTERVAL_SEC = 0.033       # ~30 FPS (33ms)
+TX_GAIN_DEFAULT_DB = 80.0         # varsayılan TX RF kazancı (jamming için yüksek)
+TX_GAIN_MAX_DB = 89.75            # B200mini TX kazanç üst sınırı
+CLASSIFY_PERIOD_SEC = 0.5         # olay tetiklendiğinde ağır AMC en fazla bu sıklıkta çalışır
+CLASSIFY_TRIGGER_DB = 10.0        # OLAY EŞİĞİ: tepe-taban farkı bunu aşınca sinyal "var" sayılır
+                                  # -> ağır AMC yalnızca o zaman çalışır (event-based, CPU korunur)
+CLASSIFY_SNAPSHOT_N = 32768       # ring buffer'dan alınacak kayıpsız sınıflandırma kaydı (örnek)
+LOOK_THROUGH_SIGNAL_TH_DB = 10.0  # arabakış: tepe-taban farkı bu eşiğin üstündeyse "kanalda sinyal var"
+# Aç/kapa (T/R) döngü periyodu ALT SINIRI — DONANIM KORUMASI. Bu, saniyedeki T/R geçiş sayısını
+# (ve TX kırmızı / RX yeşil LED yanıp sönme hızını) sınırlar. 20 ms çok agresifti (50 Hz geçiş ->
+# T/R anahtarı yıpranır, LED strobe gibi yanar, akış aç/kapa yükü artar). 250 ms -> en fazla ~4 Hz
+# geçiş: anahtar rahat, LED sakin, look-through hâlâ birkaç yüz ms'de bir 'peek' yaparak sinyal
+# sürekliliğini izler. Operatör daha büyük periyot seçebilir; daha küçük seçse de buraya klipslenir.
+LOOK_THROUGH_MIN_PERIOD_SEC = 0.25
+LOOK_THROUGH_ENDED_WINDOWS = 2    # arabakış: bu kadar ardışık BOŞ dinleme penceresi -> "yayın sonlandı"
+LOOK_THROUGH_REFOCUS_HZ = 60e3   # arabakış: hedef offseti bu kadar kayarsa gücü yeniden odakla (rebuild)
+HEALTH_POLL_SEC = 2.0             # C++ akış-sağlığı sayaçlarını raporlama periyodu
+# --- YÖN BULMA (şartname 5.1.4) ---
+DF_SIGNAL_PRESENT_DB = 6.0        # genlik-DF örneği YALNIZCA sinyal bu SNR'yi aşınca beslenir; aksi
+                                  # halde (kaynak sustuğunda) gürültü tepesi azimut-genlik haritasını
+                                  # kirletir ve sahte kerteriz üretirdi (sıralı yayın senaryosu).
+DF_PEAK_WINDOW_BINS = 2          # genlik ölçümünde tepe etrafı ±bin entegrasyonu (tek-bin gürültüsü)
+
+# --- RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1) ---
+SCAN_DETECT_DB = 10.0             # sinyal, TARİHSEL-MİN gürültü tabanını bu kadar aşarsa tespit
+SCAN_SETTLE_SEC = 0.04           # retune sonrası oturma; kısa tutuldu (FHSS/burst POI için, uzman #3)
+SCAN_MERGE_MHZ = 0.05            # bu aralıktaki tespitler aynı sinyal sayılır (birleştirilir)
+SCAN_MAX_DETECTIONS = 400        # tespit listesi üst sınırı
+# --- OTOMATİK KAZANÇ KONTROLÜ (AGC) ---
+RX_GAIN_MAX_DB = 76.0             # B200mini RX kazanç üst sınırı
+AGC_INTERVAL_SEC = 0.3            # AGC en fazla bu sıklıkta kazanç değiştirir (donanım otursun)
+AGC_CLIP_PEAK = 0.85             # tepe genlik bunu aşarsa ACİL kazanç düşür (ADC doygunluğu yakın)
+AGC_TARGET_HI = 0.70             # hedef tepe üst sınırı (üstünde yavaş düşür)
+AGC_TARGET_LO = 0.12             # hedef tepe alt sınırı (altında yükselt, sinyal zayıf)
+AGC_STEP_DOWN_DB = 3.0           # doygunluğa yakınken hızlı düşüş
+AGC_STEP_UP_DB = 2.0             # zayıf sinyalde yavaş yükseliş
+# AGC YÜKSELİŞ TAVANI: sessizlikte (sinyal yokken) kazancı donanım tavanına (76 dB) kadar
+# tırmandırmak, PTT'ye basıldığında güçlü sinyalin ADC'yi sert kırpmasına yol açar (kırpma ->
+# IQ dengesini bozar -> ayna görüntüsü + harmonik 'çim'). AGC KENDİLİĞİNDEN en fazla buraya kadar
+# yükselir; operatör elle daha yükseğe alabilir. 58 dB hâlâ yüksek hassasiyet sağlar.
+AGC_HUNT_CEILING_DB = 58.0
+
+
+class SDRWorker(QThread):
+    data_ready = pyqtSignal(dict)
+    log_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_running = False
+
+        # --- YÖN BULMA (DF) MODLARI ---
+        self.is_auto_df = True
+        self.manual_angles = (0.0, 0.0, 0.0)
+
+        # --- GERÇEK DF/KONUM ALTYAPISI (genlik-tabanlı + 3B LOB üçgenleme) ---
+        # Düğüm konumları (yerel ENU metre) config'ten; hangisi bizim ana (self) düğüm.
+        self.df_registry = load_node_registry()
+        self.self_id = self_node_id(self.df_registry)
+        # Uzak düğümlerden ağ (UDP/JSON) ile gelen + yerel üretilen kerterizlerin thread-safe deposu.
+        self.node_store = NodeBearingStore(stale_sec=5.0)
+        # Yerel (ana) düğümün genlik-tabanlı kerteriz kestiricisi (enkoder azimutu + ölçülen genlik).
+        self.self_amp_df = AmplitudeDFEstimator()
+        # HAREKETLİ TEK ALICI ile konum (spec 5.1.5): GPS'li platform hareket ederken farklı
+        # konumlardan alınan kerterizleri biriktirip üçgenler. GPS yoksa devreye girmez (sahte yok).
+        self.gps = GPSReceiver(port="/dev/ttyACM0")
+        self.gps.connect()
+        self.moving_positioner = MovingReceiverPositioner(min_baseline_m=15.0)
+        self._gps_ref = None    # ENU orijini (ilk fix'in lat/lon/alt'ı)
+        self.udp_thread = None
+        self.udp_socket = None
+
+        self.center_freq_mhz = 2400.0
+        self.gain_db = 40.0
+        self.tx_gain_db = TX_GAIN_DEFAULT_DB   # TX RF kazancı (dB); artık arayüzden ayarlanır (bulgu #2)
+        # Bant genişliği (spektrumda gösterilen frekans aralığının genişliği) her zaman
+        # gerçek örnekleme hızına (sample_rate) eşit olmalıdır; aksi halde FFT ekseni yanlış
+        # ölçekte çizilir. İkisi tek noktadan (sample_rate) türetilir.
+        self.sample_rate = 2.4e6
+        self.bandwidth_mhz = self.sample_rate / 1e6
+        self.antenna_port = "TX/RX"
+
+        # Gerçek zamanlı ses dinleme (spec 5.1.3): ring buffer -> demod -> hoparlör.
+        # Tembel (lazy) kurulur: yalnızca donanım çalışırken ve kullanıcı "Dinle" dediğinde.
+        self.audio_player = None
+        self.audio_mode = "FM"
+
+        # Sinyal izleme/takip (spec 5.1.3): ayarlı frekansa kilitlen, sürekliliği + parametre
+        # geçmişini (frekans/güç/BW sapması) izle. Tarama/TX sırasında askıya alınır.
+        self.monitor = SignalMonitor()
+
+        self.start_time = 0.0
+        
+        # Algoritma Motorları
+        self.dsp = DSPProcessor(fft_size=FFT_POINTS, antenna_spacing_m=0.0625)
+        # Ayarlı (tuned) görünüm için tarihsel-min gürültü tabanı — düşük-SNR/geniş-bant sağlamlığı.
+        self.tuned_nf = NoiseFloorTracker()
+        # ZAMAN-ORTALAMALI tespit spektrumu (doğrusal güç EMA'sı): gürültü varyansını düşürür ->
+        # zayıf ama KALICI sinyaller ortaya çıkar (şelalenin gözle yaptığı temporal integrasyon).
+        self._det_spectrum = None
+        self.jam_gen = JammingGenerator(sample_rate_hz=self.sample_rate)
+        self.gnss_gen = GNSSSpoofer(sample_rate_hz=self.sample_rate)
+        # Otomatik Modülasyon Sınıflandırıcı (Faz 1). Pahalı olduğu için her frame değil,
+        # ~0.5 sn'de bir çağrılır (bkz. run döngüsü). Örnekleme hızına bağlı -> set_bandwidth'te yenilenir.
+        self.classifier = SignalClassifier(sample_rate_hz=self.sample_rate)
+        self._clf_result = {"modulation": "Ölçülüyor...", "confidence": 0.0}
+        self._last_classify_time = 0.0
+        # FHSS zaman-geçmişi izleyici: her kare tepe-frekansı biriktirip zaman içinde atlama
+        # tespit eder (tek-blok tespitinin fiziksel imkansızlığını çözer — uzman eleştirisi #1).
+        self.hop_tracker = HoppingHistoryTracker(window_sec=2.0, min_snr_db=CLASSIFY_TRIGGER_DB)
+
+        # TX dalga-şekli üreticisi (God Object'ten ayrıldı, bulgu #4). Buffer üretimi + hedef
+        # profili + DAC güvenliği burada; SDRWorker yalnızca donanımı sürer.
+        self.tx_builder = TxWaveformBuilder(self.jam_gen, self.gnss_gen, self.sample_rate)
+
+        # Yön Bulma (DF) Doğruluk Takipçisi (5.1.4 - "Derece RMS" metriği için, ED/pasif)
+        self.df_tracker = DFAccuracyTracker(max_samples=200)
+        self._last_df_log_time = 0.0
+        
+        # Görev Kayıt (Logger) Motoru
+        self.logger = MissionLogger(db_name="sdr_mission_logs.db")
+        self.last_log_time = 0.0
+        
+        # Donanım Entegrasyonları (Sadece Anten)
+        self.hw_ctrl = HardwareController(port='/dev/ttyUSB0')
+        self.hw_ctrl.connect()
+        
+        # DSP (Gerçek Ses Demodülatörü)
+        self.audio_demod = AudioDemodulator(sample_rate=self.sample_rate, audio_rate=48000)
+
+        # Otomatik Kazanç Kontrolü (AGC): tepe genliği doygunluk-altı ideal bantta tutar.
+        self.agc_enabled = True
+        self._last_agc_time = 0.0
+        
+        # Sinyal Sınıflandırma (Hold-Time) için zaman tutucu
+        self._last_valid_sig_time = 0.0
+
+        # RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1): merkez frekansı bir aralıkta süpürüp
+        # gürültü üstü sinyalleri frekans+güçle yakalar. Frekanslar bilinmiyorken kaynakları bulmak için.
+        self.scan_active = False
+        self.scan_start_mhz = 400.0
+        self.scan_stop_mhz = 2500.0
+        self.scan_step_mhz = 2.0
+        self.scan_cursor_mhz = 0.0
+        self._scan_settle_until = 0.0
+        self.scan_detections = {}     # key -> {freq_mhz, power_dbfs, snr_db, bw_mhz, ts, count} (Max-Hold)
+        self._nf_trackers = {}        # merkez-frekans -> NoiseFloorTracker (tarihsel-min gürültü tabanı)
+
+        # Kapalı-çevrim akıllı karıştırma: son ölçülen hedef sinyalin bandı/offseti (RX'ten).
+        # Jamming başlarken bu banda odaklanılır (gücü tüm banda değil hedefe topla).
+        self._last_measured_bw_hz = 0.0
+        self._last_peak_offset_hz = 0.0
+
+        # TX Durum Değişkenleri
+        self.tx_active = False
+        self.tx_params = {
+            "mode": "NONE",
+            "jsr_db": 15.0,
+            "duty_percent": 75.0,
+            "look_time_ms": 50.0,
+            "wave_type": "Sinüs Dalga (Tone)",
+            "offset_ms": 12.0
+        }
+
+        # Donanım (USRP) durum bayrağı. Gerçek RX/TX akışları, stream nesneleri ve
+        # I/O thread'leri C++ tarafında (sdr_core.SDREngine) yönetilir; Python yalnızca
+        # motoru sürer. (Önceki sürümdeki rx_stream/tx_stream/rx_thread/io_chunk_size vb.
+        # alanlar RX C++'a taşındıktan sonra ölü kalmıştı; kaldırıldı.)
+        self.use_hardware = False
+
+        # dump_raw_iq() için en son IQ anlık görüntüsü (thread'ler arası güvenli erişim).
+        self.iq_lock = threading.Lock()
+        self.latest_iq = np.zeros(FFT_POINTS, dtype=np.complex64)
+
+    def _init_hardware(self):
+        """C++ sdr_core kütüphanesi üzerinden donanımı başlatır."""
+        if not SOAPY_AVAILABLE:
+            self.log_signal.emit("Backend: sdr_core modülü bulunamadı! Simülasyon moda geçiliyor.")
+            return False
+
+        try:
+            # Örnekleme hızı (Master Clock) değişmişse donanımı kökten yeniden başlatmak ZORUNLUDUR.
+            # Aksi halde UHD "unexpected sid" vererek çöker.
+            if getattr(self, 'hardware_initialized', False) and hasattr(self, 'engine'):
+                if getattr(self, 'last_hw_sample_rate', 0) == self.sample_rate:
+                    self.engine.set_frequency(self.center_freq_mhz * 1e6)
+                    self.engine.set_gain(self.gain_db)
+                    self.engine.set_antenna(self.antenna_port)
+                    self.use_hardware = True
+                    return True
+                else:
+                    self.log_signal.emit("Bant Genişliği Değişimi Algılandı. Donanım yeniden başlatılıyor...")
+                    # Eski motoru DETERMİNİSTİK kapat: C++ SDREngine yıkıcısı cihazı (unmake)
+                    # serbest bırakır. Yalnızca None atamak Python GC'ye bağlıdır; cihaz kilidi
+                    # yeni motor yaratılana kadar açık kalıp "device busy" hatası verebilir.
+                    # Önce stream'leri durdur, sonra referansı düşür (del ile refcount=0 -> yıkıcı).
+                    try:
+                        self.engine.stop()
+                    except Exception as exc:
+                        self.log_signal.emit(f"Backend: Eski motor durdurulurken uyarı: {exc}")
+                    del self.engine
+                    self.hardware_initialized = False
+
+            self.engine = sdr_core.SDREngine()
+            self.use_hardware = self.engine.init_hardware(self.sample_rate, self.center_freq_mhz * 1e6, self.gain_db)
+            if not self.use_hardware:
+                self.log_signal.emit("Backend: C++ Donanım Motoru başlatılamadı!")
+                return False
+                
+            self.engine.set_antenna(self.antenna_port)
+            
+            self.hardware_initialized = True
+            self.last_hw_sample_rate = self.sample_rate
+            self.log_signal.emit("Backend: C++ Motoru (sdr_core) üzerinden USRP BAŞARIYLA BAĞLANDI!")
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.log_signal.emit(f"Backend: Donanım başlatılamadı ({str(e)}). Lütfen terminaldeki detaya (traceback) bakın.")
+            return False
+
+    def _build_tx_buffer(self) -> np.ndarray:
+        """Seçili TX moduna göre donanımın looplayacağı DAC-güvenli baseband tamponunu üretir.
+        Üretim mantığı TxWaveformBuilder'a taşındı (God Object'ten ayrıştırma, bulgu #4); burada
+        yalnızca üreticiyi çağırıp moda özgü ek log (ör. GNSS Doppler) veriyoruz."""
+        
+        # Dinamik modlar (GNSS DYNAMIC_DRIFT vb.) için sürekli değişen zamana (time_sec) ihtiyaç var.
+        # Motor ne kadar süredir çalışıyor:
+        self.tx_params["time_sec"] = time.time() - getattr(self, "start_time", time.time())
+        
+        buf, meta = self.tx_builder.build(self.tx_params)
+        
+        # NOT (KRİTİK DÜZELTME): C++ "otonom GNSS motoru" (update_gnss_sats -> gnss_active) DEVRE DIŞI.
+        # O yol donanımda YALNIZCA GPS C/A üretir (GLONASS FDMA / Galileo·Beidou BOC YOK) ve aktifken
+        # tx_buffer'ı (yani burada üretilen ZENGİN çok-sistem Python baseband'ini) TAMAMEN yok sayardı.
+        # Sonuç: GALILEO/GLONASS/BEIDOU seçilse bile o frekansta GPS C/A yayınlanır (yanlış sistem) VE
+        # gnss_active bir daha false'a dönmediği için sonraki TÜM modlar (baraj/spot/analog aldatma)
+        # da bozulup GNSS yayınlar kalırdı (yeniden başlatana dek). Bu yüzden çok-sistem Python
+        # baseband'i (buf) doğrudan set_tx_buffer ile gönderilir; C++ GNSS yolu kullanılmaz.
+
+        if "gnss_service" in meta:
+            spec = self.gnss_gen.GNSS_SIGNAL_SPEC.get(meta.get("gnss_service", ""), {})
+            mod = spec.get("mod", "BPSK"); fam = spec.get("fam", "?")
+            fdma = " + FDMA" if spec.get("fdma") else ""
+            coords = meta.get('target_coords', '?')
+            s_mode = meta.get('spoof_mode', 'MANUAL')
+            
+            self.log_signal.emit(
+                f"Backend: GNSS baseband üretildi -> {meta.get('gnss_service')} "
+                f"({fam} {mod}{fdma}, ≥4 uydu + nav data) | Mod: {s_mode} | Koordinat: [{coords}]")
+        return buf
+
+    def trigger_tx(self, params: dict):
+        self.tx_params.update(params)
+
+        # TX RF KAZANCI (bulgu #2): operatör arayüzden verir; koda gömülü sabit yerine kullanılır.
+        # B200mini üst sınırına (TX_GAIN_MAX_DB) ve 0'a güvenli şekilde kırpılır.
+        if "tx_gain_db" in params:
+            try:
+                self.tx_gain_db = float(np.clip(float(params["tx_gain_db"]), 0.0, TX_GAIN_MAX_DB))
+            except (TypeError, ValueError):
+                pass
+
+        # KARIŞTIRMA FREKANSI (sürekli karıştırma): operatör TX ekranından girdiği frekansa geç.
+        # (GNSS/Wi-Fi modları aşağıda kendi bandına zaten otomatik geçer; onlarda bu atlanır.)
+        if params.get("tx_freq_mhz") and self.tx_params.get("mode") not in ("GNSS_SPOOF", "WIFI_JAMMING"):
+            try:
+                self.set_frequency(float(params["tx_freq_mhz"]))
+                self.log_signal.emit(f"Backend: Karıştırma frekansı -> {float(params['tx_freq_mhz']):.3f} MHz")
+            except (TypeError, ValueError):
+                pass
+
+        # GNSS aldatma: seçilen servisin taşıyıcı frekansına OTOMATİK geç (GPS L1/L2/L5, GLONASS,
+        # Galileo, Beidou...). Aksi halde yanlış frekansta "GNSS" yayını yapılır.
+        if self.tx_params.get("mode") == "GNSS_SPOOF":
+            service = self.tx_params.get("gnss_code", "GPS L1")
+            freq_mhz = self.gnss_gen.GNSS_SERVICES.get(service)
+            if freq_mhz is None:                          # bilinmeyen/eski etiket -> GPS L1
+                service, freq_mhz = "GPS L1", 1575.42
+            if abs(self.center_freq_mhz - freq_mhz) > 1e-3:
+                self.set_frequency(freq_mhz)
+            self.log_signal.emit(f"Backend: GNSS aldatma servisi -> {service} ({freq_mhz:.3f} MHz)")
+            # Servisin kod-oranı/BOC/FDMA'sının TEMİZ üretimi için önerilen örnekleme hızı. Çalışan
+            # akışta örnekleme hızını değiştirmek UHD'yi çökertebildiği için OTOMATİK değiştirmiyoruz;
+            # yetersizse operatörü uyarıyoruz (sinyal yine üretilir, ama düşük hızda aliaslanabilir).
+            rec_fs = self.gnss_gen.recommended_fs_hz(service)
+            if self.sample_rate < rec_fs * 0.95:
+                self.log_signal.emit(
+                    f"⚠️ GNSS: {service} için önerilen örnekleme ≥{rec_fs/1e6:.1f} MHz "
+                    f"(şu an {self.sample_rate/1e6:.1f} MHz). Temiz kod-oranı/BOC/FDMA için "
+                    f"Bant Genişliğini {rec_fs/1e6:.1f} MHz yapıp yayını yeniden başlatın.")
+
+        # ANALOG ALDATMA — GERÇEK SES MESAJI (5.2.3): WAV dalga-şekli seçildiyse dosyayı YÜKLE ve
+        # örneklerini tx_params'a koy. Hedef analog telsiz gerçek-dışı ama ANLAŞILIR sahte yayını
+        # çalar ('yanlış duyar'). Dosya yoksa/bozuksa dürüstçe uyar, sentetik ses üretme.
+        if (self.tx_params.get("mode") == "ANALOG_SPOOF"
+                and self.tx_params.get("wave_type") == WAV_DECEPTION_WAVE):
+            path = self.tx_params.get("decept_audio_file", "")
+            try:
+                audio, arate = load_wav_mono(path)
+                self.tx_params["decept_audio"] = audio
+                self.tx_params["decept_audio_rate"] = arate
+                dur = len(audio) / float(arate) if arate else 0.0
+                self.log_signal.emit(f"Backend: Aldatma ses mesajı yüklendi -> {path} "
+                                     f"({dur:.1f} s, {arate} Hz, {self.tx_params.get('decept_mod','NBFM')})")
+            except Exception as exc:
+                self.tx_params.pop("decept_audio", None)
+                self.log_signal.emit(f"⚠️ Aldatma: ses dosyası yüklenemedi ({exc}). "
+                                     f"Geçerli bir WAV seçin — sahte ses üretilmeyecek.")
+
+        # WI-FI ENGELLEME (bulgu #9): artık gerçek baraj yayını. Seçilen Wi-Fi bandının merkez
+        # frekansına geçilir (2.4 GHz -> kanal 6, 5.8 GHz) ve geniş-bant baraj gönderilir.
+        if self.tx_params.get("mode") == "WIFI_JAMMING":
+            band = self.tx_params.get("wifi_band", "2.4 GHz (802.11 b/g/n)")
+            freq_mhz = WIFI_BAND_CENTERS.get(band, 2437.0)
+            if abs(self.center_freq_mhz - freq_mhz) > 1e-3:
+                self.set_frequency(freq_mhz)
+            self.log_signal.emit(f"Backend: Wi-Fi engelleme (baraj) -> {band} ({freq_mhz:.1f} MHz)")
+
+        # KAPALI-ÇEVRİM AKILLI KARIŞTIRMA: RX'te bir hedef sinyal ölçüldüyse (bant tüm bandı
+        # doldurmayan gerçek bir sinyal), baraj modlarında gücü o hedef bandına odakla. Aksi halde
+        # (sinyal yok/tüm bant dolu) profil bant genişliği kullanılır.
+        bw = self._last_measured_bw_hz
+        if 0.0 < bw < 0.85 * self.sample_rate:
+            self.tx_params["focus_bw_hz"] = bw
+            self.tx_params["focus_offset_hz"] = self._last_peak_offset_hz
+            self.log_signal.emit(
+                f"Backend: Akıllı karıştırma -> hedef bandına odaklanıldı "
+                f"(~{bw/1e3:.0f} kHz @ {self._last_peak_offset_hz/1e3:+.0f} kHz offset)")
+        else:
+            self.tx_params.pop("focus_bw_hz", None)
+            self.tx_params.pop("focus_offset_hz", None)
+
+        # Look-through T/R + kapalı-çevrim durum makinesini sıfırla: her tetiklemede yayın fazından
+        # ve AKTİF (sinyal var varsayımı) başla. Dinleme ölçümleri durumu günceller.
+        self._lt_tx_on = True
+        self._lt_rx_on = False        # jam fazında başlar -> RX kapalı (bkz. _lt_set_rx / trigger_tx)
+        self._lt_display_fft = None   # jam penceresinde sabit tutulacak son gerçek dinleme spektrumu
+        self._lt_phase_start = time.time()
+        self._lt_present = True
+        self._lt_active = True
+        self._lt_empty_count = 0
+        self._lt_bw_hz = 0.0
+        self._lt_peak_offset_hz = 0.0
+        # İlk odak, tetiklemedeki RX ölçümünden geldiyse onu uygulanmış say (gereksiz rebuild olmasın)
+        _fb = self.tx_params.get("focus_bw_hz")
+        self._lt_focus_applied = (float(_fb), float(self.tx_params.get("focus_offset_hz", 0.0))) if _fb else None
+
+        self.tx_pre_gen = self._build_tx_buffer()
+        self._tx_sim_idx = 0  # simülasyon modunda tampon üzerinde gezinme indeksi
+        self._tx_disp_ema = None  # TX spektrum ortalamasını sıfırla (yeni TX eski şekli taşımasın)
+
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.set_tx_gain(self.tx_gain_db)   # TX kazancını uygula (arayüzden, kontrollü)
+            self.engine.set_tx_buffer(self.tx_pre_gen)
+            # JAM FAZINDA RX KAPALI: tam-çift-yönlü USB yükü (RX+TX) TX underflow'una ve zayıf jam
+            # gücüne yol açar. Her iki modda da yayın RX kapalı başlar (5.2.1: almaç gerekmez).
+            # ARABAKIŞ (look-through): RX yalnızca DİNLEME penceresinde açılır (_service_look_through
+            # her faz geçişinde set_rx_enabled ile toggle eder) -> jam penceresi USB'yi tam kullanır,
+            # underflow'suz + TAM GÜÇ; dinleme penceresinde kanal ölçülür.
+            if hasattr(self.engine, 'set_rx_enabled'):
+                self.engine.set_rx_enabled(False)
+            self.engine.set_tx_active(True)
+
+        self.tx_active = True
+        # Full-duplex uyarısı: B200mini'de "TX/RX" tek fiziksel porttur. RX de aynı porta
+        # ayarlıysa, karıştırırken eşzamanlı dinleme (jam-while-listen) fiziksel olarak
+        # mümkün değildir; operatör RX antenini "RX2"ye almalıdır.
+        if self._is_running and self.antenna_port == "TX/RX":
+            self.log_signal.emit(
+                "⚠️ UYARI: RX ve TX aynı 'TX/RX' portunu paylaşıyor. Karıştırma sırasında "
+                "eşzamanlı dinleme için RX Anten Portunu 'RX2' seçin.")
+        tgt = self.tx_params.get("target_signal", "")
+        tgt_str = f" | Hedef: {tgt}" if tgt else ""
+        self.log_signal.emit(
+            f"Backend: TX Karıştırma Aktif -> {self.tx_params['mode']} "
+            f"(JSR: {self.tx_params['jsr_db']} dB | TX Gain: {self.tx_gain_db:.1f} dB){tgt_str}")
+
+    def stop_tx(self):
+        self.tx_active = False
+        self.tx_params["mode"] = "NONE"
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.set_tx_active(False)
+            # Karıştırma bitti -> RX'i yeniden aç (spektrum/analiz/DF sürsün)
+            if hasattr(self.engine, 'set_rx_enabled'):
+                self.engine.set_rx_enabled(True)
+        self._lt_tx_on = False
+        self.log_signal.emit("Backend: TX Yayın Düzeneği Durduruldu.")
+
+    def _run_signal_analysis(self, iq1):
+        """RX SİNYAL ANALİZİ: spektrum (FFT) + event-tetiklemeli modülasyon/protokol/FHSS
+        sınıflandırma. run()'dan ayrıldı (God Object azaltma). Dönüş: (fft_dbm, spectrum_info);
+        yan etki: self._clf_result, self._last_measured_bw_hz/_last_peak_offset_hz güncellenir.
+        DF/nirengi mantığına DOKUNMAZ (o run() içinde ayrı kalır)."""
+        if self.tx_active:
+            # TX sırasında HAFİF işle: tek FFT (pahalı Welch + kümülant DEĞİL) -> CPU düşük,
+            # tx_worker aç kalmaz (underflow olmaz), kendi TX sinyalimiz spektrumda görünür.
+            x = iq1 - np.mean(iq1)
+            win = np.hamming(len(x))
+            fc = np.fft.fftshift(np.fft.fft(x * win, n=FFT_POINTS))
+            raw_lin = np.abs(fc) ** 2 / FFT_POINTS
+            # TX SPEKTRUM ORTALAMA (GNSS/baraj gibi GÜRÜLTÜ-BENZERİ geniş-bant sinyaller için KRİTİK):
+            # tek-atış FFT tepesi her karede ±yüz kHz zıplar -> spektrum "yanlış/rastgele hareket ediyor"
+            # görünür (özellikle GNSS spread-spektrum, tek dominant tepe YOKTUR). Doğrusal-güç EMA (~5
+            # kare) ile ortalayınca gerçek geniş-bant ŞEKLİ KARARLI çizilir — spektrum analizör 'average/
+            # RMS' dedektörünün yaptığı. (LOOK_THROUGH dinleme penceresi aşağıda kendi ham FFT'sini kullanır.)
+            # alpha=0.9 (~10 kare): kare-kare değişim 4.8 dB -> 0.3 dB (ölçüldü) -> spektrum KARARLI.
+            _prev = getattr(self, "_tx_disp_ema", None)
+            if _prev is None or getattr(_prev, "shape", None) != raw_lin.shape:
+                self._tx_disp_ema = raw_lin
+            else:
+                self._tx_disp_ema = 0.9 * _prev + 0.1 * raw_lin
+            fft_dbm = 10.0 * np.log10(self._tx_disp_ema + 1e-12)
+
+            if self.tx_params.get("mode") == "LOOK_THROUGH":
+                if getattr(self, "_lt_tx_on", True):
+                    # JAM penceresi: RX KAPALI -> iq1 bayat. Bu pencerede FFT'yi yeniden hesaplama
+                    # (bayat/jammer-sızıntısı veriyle ekran zıplar, seviye aşağı inmez). Bunun yerine
+                    # SON GERÇEK DİNLEME görüntüsünü SABİT TUT -> ekran kararlı, gerçek kanal seviyesini
+                    # (TX kapalıyken, sızıntısız) gösterir. İlk jam penceresinde henüz görüntü yoksa
+                    # hesaplanan bayat kareyi kullan (tek seferlik).
+                    held = getattr(self, "_lt_display_fft", None)
+                    if held is not None and getattr(held, "shape", None) == fft_dbm.shape:
+                        fft_dbm = held
+                    spectrum_info = {"occupied_bw_hz": 0.0,
+                                     "signal_class": "ARABAKIŞ: yayın penceresi (jammer aktif)",
+                                     "flatness": None, "snr_db": 0.0}
+                else:
+                    # Dinleme penceresi: TX FİZİKSEL kapalı -> RX gerçek kanalı görür. Bu pencerede TX
+                    # akmadığı için TAM spektrum (compute_fft_dbm) + analyze_spectrum kullanılır: tek-kare
+                    # ham tepe-medyan gürültüde ~13 dB'e çıkıp YANLIŞ 'sinyal var' verir; analyze_spectrum
+                    # (present_db, yüzdelik taban) tek-kare gürültüye karşı SAĞLAMDIR.
+                    # Enerji KAZANCI (sinyal var) / KAYBI (yayın sonlandı) + hedef bandı (offset/BW) ölç.
+                    fft_dbm, _lraw = self.dsp.compute_fft_dbm(iq1)
+                    # Bu GERÇEK dinleme görüntüsünü sakla -> sonraki jam pencerelerinde sabit tutulur
+                    # (ekran zıplamasın, seviye gerçek kanalda kalsın).
+                    self._lt_display_fft = fft_dbm
+                    li = self.dsp.analyze_spectrum(fft_dbm, self.sample_rate, present_db=8.0)
+                    snr = float(li.get("snr_db", 0.0) or 0.0)
+                    occ_bw = float(li.get("occupied_bw_hz", 0.0) or 0.0)
+                    # KESİN karar: analyze_spectrum'un sağlam SNR'ı (tepe - yüzdelik taban) eşiği aşmalı.
+                    # (Gürültü ~4-6 dB, gerçek hedef ~onlarca dB -> net ayrım; 'zayıf sinyal' bandı sızmaz.)
+                    present = snr > LOOK_THROUGH_SIGNAL_TH_DB and occ_bw > 0.0
+                    n_fft = len(fft_dbm)
+                    peak_bin = int(np.argmax(fft_dbm))
+                    peak_off = (peak_bin - n_fft / 2.0) / n_fft * self.sample_rate
+                    # Arabakış durum makinesi için sakla
+                    self._lt_present = present
+                    self._lt_peak_offset_hz = peak_off if present else 0.0
+                    self._lt_bw_hz = occ_bw if present else 0.0
+                    if present:
+                        sig_cls = (f"ARABAKIŞ [enerji KAZANCI]: kanalda sinyal (SNR {snr:.0f} dB, "
+                                   f"~{occ_bw/1e3:.0f} kHz @ {peak_off/1e3:+.0f} kHz)")
+                    else:
+                        sig_cls = "ARABAKIŞ [enerji KAYBI]: kanal boş (yayın sonlandı) — karıştırma duraklatılıyor"
+                    spectrum_info = {"occupied_bw_hz": occ_bw, "signal_class": sig_cls,
+                                     "flatness": None, "snr_db": round(snr, 1)}
+            else:
+                spectrum_info = {"occupied_bw_hz": 0.0, "signal_class": "TX AKTİF (kendi sinyali görünür)",
+                                 "flatness": None, "snr_db": 0.0}
+            self._clf_result = {"modulation": "TX AKTİF", "confidence": 0.0,
+                                "multiplex": "-", "ekkt": "-", "protocol": "-"}
+            return fft_dbm, spectrum_info
+
+        # --- RX (TX kapalı): tam analiz ---
+        fft_dbm, raw_fft = self.dsp.compute_fft_dbm(iq1)
+        self._last_fft_dbm = fft_dbm
+        # ZAMAN-ORTALAMA (doğrusal güç EMA, ~8 kare): gürültü varyansını düşürür -> zayıf kalıcı
+        # sinyaller ortaya çıkar. Ortalanan spektrumda gürültü tepe-tabanı ~3 dB'e iner; bu yüzden
+        # present_db düşürülebilir (weak sinyal yakalanır, gürültü yanlış-pozitifi olmaz).
+        lin = np.power(10.0, raw_fft / 10.0)
+        if self._det_spectrum is None or self._det_spectrum.shape != lin.shape:
+            self._det_spectrum = lin
+        else:
+            self._det_spectrum = 0.82 * self._det_spectrum + 0.18 * lin
+        det_dbm = 10.0 * np.log10(self._det_spectrum + 1e-12)
+        nf = self.tuned_nf.update(det_dbm)     # tarihsel-min taban (ortalanmış spektrum üzerinde)
+        spectrum_info = self.dsp.analyze_spectrum(det_dbm, self.sample_rate, noise_floor=nf, present_db=4.5)
+
+        # UCUZ GÖZCÜ (her kare): sinyal var mı + FHSS zaman-geçmişini besle (event-based watcher).
+        now = time.time()
+        peak_bin = int(np.argmax(fft_dbm))
+        sig_snr = float(fft_dbm[peak_bin] - np.median(fft_dbm))
+        peak_norm = peak_bin / float(len(fft_dbm))
+        self.hop_tracker.update(now, peak_norm, sig_snr)
+        ekkt_hist, hop_n, _hop_info = self.hop_tracker.detect()
+
+        # Kapalı-çevrim akıllı karıştırma için hedef bandını/offsetini sakla (RX ölçümü).
+        self._last_measured_bw_hz = float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0)
+        self._last_peak_offset_hz = (peak_bin - len(fft_dbm) / 2.0) / len(fft_dbm) * self.sample_rate
+
+        # OTOMATİK MERKEZLEME (dinleme): en güçlü sinyalin offsetini ses demoduna ver -> operatör tam
+        # tune etmese bile demod sinyali DC'ye çeker (merkez-dışı sinyal süzülüp gürültü kalmasın).
+        # Yalnızca makul mistune aralığında (±150 kHz) uygula; uzak bir sinyale sıçrayıp yanlış
+        # merkezleme yapmasın. Sinyal varken (SNR yeterli) geçerli, aksi halde 0 (merkez).
+        if getattr(self, "audio_player", None) is not None and self.audio_player.is_running():
+            off = self._last_peak_offset_hz if (sig_snr >= 6.0 and abs(self._last_peak_offset_hz) < 150e3) else 0.0
+            self.audio_player.set_tuning_offset(off)
+
+        # OLAY-TETİKLEMELİ AĞIR AMC: yalnızca sinyal eşiği aşılınca + periyot dolunca.
+        # (Bant TARAMA sırasında kapalı: pencere hızla değişir, sınıflandırma anlamsız + CPU israfı.)
+        if self.use_hardware and not self.scan_active and sig_snr >= CLASSIFY_TRIGGER_DB:
+            self._last_valid_sig_time = now
+            if (now - self._last_classify_time) >= CLASSIFY_PERIOD_SEC:
+                snap = self._get_classify_snapshot(iq1)
+                self._clf_result = self.classifier.classify(snap, check_hopping=False)
+                # ANALOG/SAYISAL KESİNLEŞTİRME (5.1.2) — ŞİMDİLİK KAPALI: sınıflandırıcı yalnızca
+                # AM/FM (analog) döndürüyor; FM↔FSK ses-tabanlı ayrımına gerek yok. Dijital türler
+                # açılınca geri ekleyin:
+                # if "FM/FSK" in self._clf_result.get("modulation", ""):
+                #     self._refine_fm_fsk(snap)
+                self._clf_result["occupied_bw_hz"] = spectrum_info.get("occupied_bw_hz", 0.0)
+                self._last_classify_time = now
+        elif self.use_hardware:
+            # Sinyal eşik altına düştüğünde (örn. konuşma boşluğu/fading), yazının anında 
+            # "Sinyal yok" olarak değişip titremesini (flickering) önlemek için 3 saniyelik "Hold Time"
+            hold_time = 3.0
+            if (now - self._last_valid_sig_time) > hold_time:
+                self._clf_result = {"modulation": "Sinyal yok (eşik altı)", "confidence": 0.0}
+
+        # FHSS (frekans atlama — dijital) override ŞİMDİLİK KAPALI. Yalnızca AM/FM tespit ediyoruz.
+        # Dijital türler açılınca geri ekleyin:
+        # if ekkt_hist.startswith("FHSS"):
+        #     self._clf_result["modulation"] = "FHSS (Atlamalı)"
+        #     self._clf_result["occupied_bw_hz"] = spectrum_info.get("occupied_bw_hz", 0.0)
+        return fft_dbm, spectrum_info
+
+    def _do_periodic_logging(self, target_x, target_y, df, spectrum_info, self_bearing_deg):
+        """~1 Hz görev/sinyal/DF loglaması (SQLite). run()'dan ayrıldı (God Object azaltma).
+        Görev hedefi + sinyal istihbaratı + DF fix + DF doğruluk (Derece RMS) kayıtları."""
+        now = time.time()
+        if (now - self.last_log_time) >= 1.0:
+            self.logger.log_target(
+                freq_mhz=self.center_freq_mhz, x_km=target_x, y_km=target_y,
+                tx_mode=self.tx_params["mode"] if self.tx_active else "NONE", notes="Oto-Kestirim")
+            self.last_log_time = now
+
+        # Sinyal istihbaratı: gerçek bir sinyal sınıflandırıldıysa
+        mod = self._clf_result.get("modulation", "")
+        is_real = mod and not any(s in mod for s in ("Sinyal yok", "Ölçülüyor", "TX AKTİF", "Belirlenemedi"))
+        if is_real and not self.tx_active and (now - getattr(self, "_last_siglog_time", 0.0)) >= 1.0:
+            self.logger.log_signal(
+                freq_mhz=self.center_freq_mhz, modulation=mod,
+                multiplex=self._clf_result.get("multiplex", "-"),
+                ekkt=self._clf_result.get("ekkt", "-"),
+                protocol=self._clf_result.get("protocol", "-"),
+                occupied_bw_hz=float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0),
+                snr_db=float(spectrum_info.get("snr_db", 0.0) or 0.0),
+                confidence=float(self._clf_result.get("confidence", 0.0) or 0.0))
+            self._last_siglog_time = now
+
+        # Yön bulma/konum fix logu
+        if df["fix"] and (now - getattr(self, "_last_dffix_log_time", 0.0)) >= 1.0:
+            self.logger.log_df_fix(
+                freq_mhz=self.center_freq_mhz, pos_xyz=df["position_xyz_m"],
+                residual_m=df["residual_m"], node_count=df["active_count"],
+                target_bearing_deg=df["target_bearing_deg"], target_range_m=df["target_range_m"],
+                target_elevation_deg=df["target_elevation_deg"],
+                nodes={nid: {k: r.get(k) for k in ("azimuth_deg", "elevation_deg", "amp_dbm",
+                                                   "snr_db", "freq_mhz", "is_self")}
+                       for nid, r in df["nodes"].items()})
+            self._last_dffix_log_time = now
+
+        # DF doğruluk (Derece RMS) — kalibrasyon referansı tanımlıysa
+        ref = df["df_reference_deg"]
+        if ref is not None and (now - self._last_df_log_time) >= 1.0:
+            self.logger.log_df_accuracy(
+                reference_deg=ref, measured_deg=round(self_bearing_deg or 0.0, 2),
+                rms_error_deg=df["df_rms_deg"] if df["df_rms_deg"] is not None else 0.0,
+                sample_count=self.df_tracker.sample_count())
+            self._last_df_log_time = now
+
+    def _feed_moving_positioner(self, bearing_deg: float, now: float):
+        """GPS fix varsa alıcının anlık konumunu ENU'ya çevirip (konum, kerteriz) örneği ekler.
+        İlk fix ENU orijini olur. GPS yoksa/fix yoksa hiçbir şey yapmaz (sahte konum üretmez)."""
+        if self.gps is None or not self.gps.has_fix:
+            return
+        pos = self.gps.get_position()
+        if pos is None:
+            return
+        lat, lon, alt = pos
+        if self._gps_ref is None:
+            self._gps_ref = (lat, lon, alt)     # ilk fix -> yerel ENU orijini
+        enu = geodetic_to_enu(lat, lon, alt, self._gps_ref[0], self._gps_ref[1], self._gps_ref[2])
+        self.moving_positioner.add(enu, bearing_deg, 0.0, now)
+
+    def _robust_peak_power_dbm(self, fft_dbm) -> float:
+        """Tepe etrafı ±DF_PEAK_WINDOW_BINS bin DOĞRUSAL güç entegrasyonu ile sağlam tepe-güç (dBm).
+        Tek-bin max'e göre gürültüye daha dayanıklı -> genlik-DF kerterizi daha kararlı (Derece RMS↓)."""
+        n = len(fft_dbm)
+        peak_bin = int(np.argmax(fft_dbm))
+        w = DF_PEAK_WINDOW_BINS
+        lo, hi = max(0, peak_bin - w), min(n, peak_bin + w + 1)
+        lin = np.power(10.0, np.asarray(fft_dbm[lo:hi]) / 10.0)
+        return float(10.0 * np.log10(np.mean(lin) + 1e-12))
+
+    def _run_direction_finding(self, iq1, spectrum_info=None):
+        """GERÇEK YÖN BULMA + KONUM (genlik-tabanlı DF + 3B LOB üçgenleme).
+
+        1) YEREL KERTERİZ: anten elle döndürülürken enkoder azimutu + ölçülen (kalibre) genlik
+           AmplitudeDFEstimator'a beslenir; en yüksek genliğin azimutu = yerel düğüm kerterizi.
+           Genlik örneği YALNIZCA sinyal SNR eşiğini (DF_SIGNAL_PRESENT_DB) aşınca beslenir —
+           kaynak sustuğunda (sıralı yayın) gürültü tepesi haritayı kirletip sahte kerteriz üretmesin.
+        2) FÜZYON: yerel + uzak (ağdan JSON) taze kerterizler, düğüm konumlarıyla 3B üçgenlenir
+           -> kaynağın (x,y,z) konumu + kesişim kalitesi (kalıntı).
+        3) DERECE RMS: yerel kerteriz, kalibrasyon referansıyla kıyaslanır (şartname 5.1.4).
+        Dönüş: payload'a konacak df sözlüğü. (Sentetik iq2/iq3 faz-DF tamamen kaldırıldı.)"""
+        now = time.time()
+        # GENLİK-DF için HEDEF (en güçlü sinyal) gücünü kullan — TOPLAM bant gücünü DEĞİL. Yönlü
+        # antenin hedefe tepkisi tepe gücüyle ölçülür. Tek-bin tepe gürültülüdür; tepe etrafı ±W bin
+        # DOĞRUSAL güç entegrasyonu ile sağlam bir tepe-güç ölçümü alınır (Derece RMS'yi iyileştirir).
+        fft_dbm = getattr(self, "_last_fft_dbm", None)
+        if fft_dbm is not None and len(fft_dbm) > 0:
+            self_amp = self._robust_peak_power_dbm(fft_dbm)
+        else:
+            self_amp = self.dsp.compute_channel_power_dbm(iq1)
+
+        # SİNYAL VARLIĞI: analiz SNR'si (zaman-ortalamalı, sağlam). Yoksa tepe-medyan farkına düş.
+        if spectrum_info is not None:
+            sig_snr = float(spectrum_info.get("snr_db", 0.0) or 0.0)
+        elif fft_dbm is not None and len(fft_dbm) > 0:
+            sig_snr = float(self_amp - float(np.median(fft_dbm)))
+        else:
+            sig_snr = 0.0
+        present = sig_snr >= DF_SIGNAL_PRESENT_DB
+        self_bearing = None
+
+        if not self.is_auto_df:
+            # MANUEL mod: operatörün girdiği açılar doğrudan düğüm kerterizleri olarak kullanılır.
+            ids = list(self.df_registry.keys())
+            for i, nid in enumerate(ids[:3]):
+                self.node_store.set_self_bearing(nid, self.manual_angles[i], 0.0, self_amp,
+                                                 snr_db=sig_snr, freq_mhz=self.center_freq_mhz)
+            self_bearing = self.manual_angles[0]
+        else:
+            # OTONOM (genlik-tabanlı): enkoder bağlıysa döndürme taramasından tepe azimutu bul.
+            # Genlik haritasını YALNIZCA sinyal varken besle (gürültü kirletmesini önle); ama birikmiş
+            # kerterizi her karede oku (kaynak kısa sustuğunda son geçerli kerteriz decay süresince kalır).
+            if self.hw_ctrl.is_connected:
+                enc_az = self.hw_ctrl.get_angle()
+                if present:
+                    self.self_amp_df.update(enc_az, self_amp, now)
+                self_bearing, pk, conf, n = self.self_amp_df.bearing(now)
+                if self_bearing is not None:
+                    self.node_store.set_self_bearing(self.self_id, self_bearing, 0.0, self_amp,
+                                                     snr_db=sig_snr, freq_mhz=self.center_freq_mhz)
+                    # HAREKETLİ TEK ALICI (5.1.5): GPS fix varsa, bu kerterizi alıcının GPS konumuyla
+                    # birlikte biriktir; platform hareket ettikçe farklı konumlardan kerterizler
+                    # üçgenlenerek kaynağın konumu bulunur. GPS yoksa bu blok atlanır (sahte yok).
+                    self._feed_moving_positioner(self_bearing, now)
+                else:
+                    # Yerel kerteriz üretilemiyor (sinyal yok / yetersiz tarama) -> yerel kerterizi
+                    # füzyondan düşür (bayat kalıp yanlış üçgenlemeye girmesin). Yalnızca ENKODER
+                    # bağlıyken; aksi halde depodaki (ağ) verilerine dokunma.
+                    self.node_store.set_self_bearing(self.self_id, None)
+
+        # Derece RMS (kalibrasyon referansı tanımlıysa)
+        if self_bearing is not None:
+            self.df_tracker.add_measurement(self_bearing)
+        df_rms_deg = self.df_tracker.rms_error_deg()
+
+        # FÜZYON: taze kerterizleri düğüm konumlarıyla eşleyip 3B üçgenle
+        active = self.node_store.active_bearings(now)
+        positions, directions = [], []
+        for nid, rec in active.items():
+            cfg = self.df_registry.get(nid)
+            if not cfg:
+                continue
+            positions.append(cfg["pos"])
+            directions.append(azel_to_unit(rec["azimuth_deg"], rec["elevation_deg"]))
+        if len(positions) >= 2:
+            pos, residual_m, fix, cross_deg = triangulate_lob(positions, directions)
+        else:
+            pos, residual_m, fix, cross_deg = (np.zeros(3), 0.0, False, 0.0)
+
+        # Arayüz izleme: yalnızca REGISTRY'de tanımlı düğümler (bilinmeyen id'ler konumsuz olduğu
+        # için PPI'da merkeze çizilip yanıltırdı; bunları eleyip logluyoruz).
+        raw_snap = self.node_store.snapshot()
+        snap = {}
+        for nid, rec in raw_snap.items():
+            cfg = self.df_registry.get(nid)
+            if cfg is None:
+                if (now - getattr(self, "_last_unknown_node_warn", 0.0)) > 5.0:
+                    self.log_signal.emit(f"⚠️ DF: bilinmeyen düğüm id '{nid}' (df_nodes.json'da tanımlı değil) — yok sayıldı.")
+                    self._last_unknown_node_warn = now
+                continue
+            rec["pos"] = cfg.get("pos", [0.0, 0.0, 0.0])
+            rec["is_self"] = bool(cfg.get("self"))
+            snap[nid] = rec
+
+        # Ana düğümden kaynağa kerteriz/menzil (PPI için hazır)
+        self_pos = self.df_registry.get(self.self_id, {}).get("pos", [0.0, 0.0, 0.0])
+        tgt_az, tgt_range, tgt_el = bearing_from_positions(self_pos, pos) if fix else (0.0, 0.0, 0.0)
+
+        # UZAK DÜĞÜM (self olmayan) CANLI BAĞLANTI DURUMU — arayüzde ANT-2/ANT-3 yeşil/kırmızı için.
+        # REGISTRY tabanlı: hiç veri göndermemiş bir düğüm bile listede olur (bağlı değil=kırmızı).
+        # connected = kayıt VAR ve BAYAT DEĞİL (son stale_sec içinde JSON geldi).
+        remote_nodes = []
+        for nid, cfg in self.df_registry.items():
+            if cfg.get("self"):
+                continue
+            rec = raw_snap.get(nid)
+            remote_nodes.append({
+                "id": nid,
+                "connected": bool(rec is not None and not rec.get("stale", True)),
+                "age_sec": (rec.get("age_sec") if rec is not None else None),
+            })
+
+        # HAREKETLİ TEK ALICI (5.1.5): biriken (GPS konumu, kerteriz) örneklerinden ayrı bir konum
+        # kestirimi. Çok-düğüm füzyonundan bağımsız; GPS'li tek alıcı senaryosunu karşılar.
+        mv_pos, mv_res, mv_fix, mv_cross = self.moving_positioner.estimate(now)
+        moving = {
+            "fix": bool(mv_fix),
+            "position_xyz_m": [round(float(v), 2) for v in mv_pos],
+            "residual_m": mv_res,
+            "crossing_deg": mv_cross,
+            "samples": self.moving_positioner.sample_count(),
+            "baseline_m": self.moving_positioner.baseline_m(),
+            "gps": self.gps.status() if self.gps is not None else {"connected": False, "has_fix": False},
+        }
+
+        return {
+            "self_bearing_deg": self_bearing,
+            "position_xyz_m": [round(float(v), 2) for v in pos],
+            "residual_m": residual_m,
+            "fix": fix,
+            "fix_quality_deg": cross_deg,     # LOB kesişim açısı (GDOP): büyük=iyi geometri
+            "dimensionality": ("3B" if abs(float(pos[2])) > 1e-6 else "2B (yer izdüşümü)"),
+            "nodes": snap,
+            "remote_nodes": remote_nodes,     # uzak düğüm canlı bağlantı durumu (ANT-2/3 yeşil/kırmızı)
+            "active_count": len(positions),
+            "target_bearing_deg": tgt_az,
+            "target_range_m": tgt_range,
+            "target_elevation_deg": tgt_el,
+            "df_rms_deg": df_rms_deg,
+            "df_reference_deg": self.df_tracker.reference_deg,
+            "df_sample_count": self.df_tracker.sample_count(),
+            "moving": moving,     # hareketli tek alıcı (GPS) ile konum kestirimi
+        }
+
+    def _refine_fm_fsk(self, snap):
+        """FM/FSK 'Ortak' sinyali SESE demodüle edip ANALOG mı SAYISAL mı KESİN belirler (5.1.2).
+        En güçlü tepeyi DC'ye kaydırır -> ham FM ayrımlayıcı (~48 kHz) -> classify_fm_or_fsk (ayrık
+        seviye/dwell). Sonucu _clf_result.modulation'a yazar; böylece worker'ın analog/sayısal etiket
+        mantığı ('Sayısal' -> SAYISAL KESİN, 'FM' -> ANALOG KESİN) otomatik doğru çalışır. Kararsızsa
+        (is_digital None) 'FM/FSK Ortak' bırakır (dürüst). Sahte üretmez."""
+        if snap is None or len(snap) < 8192:
+            return
+        try:
+            snap = np.asarray(snap, dtype=np.complex64)
+            off = float(getattr(self, "_last_peak_offset_hz", 0.0) or 0.0)
+            if abs(off) > 1.0:
+                t = np.arange(len(snap)) / self.sample_rate
+                snap = (snap * np.exp(-1j * 2 * np.pi * off * t)).astype(np.complex64)
+            # Ham FM ayrımlayıcı (de-emphasis/AGC yok) — NBFM kanalına daralt, ~48 kHz'e indir
+            if (getattr(self, "_refine_demod", None) is None
+                    or abs(self._refine_demod.sample_rate - self.sample_rate) > 1.0):
+                self._refine_demod = StreamingDemodulator(self.sample_rate, mode="FM",
+                                                          digital=True, channel_bw=12500.0)
+            self._refine_demod.reset()
+            disc = self._refine_demod.process(snap)
+            if len(disc) < 512:
+                return
+            r = classify_fm_or_fsk(disc, self._refine_demod.out_rate)
+            if r.get("is_digital") is True:
+                baud = r.get("symbol_rate_hz", 0.0)
+                self._clf_result["modulation"] = (f"FSK/C4FM (Sayısal-Frekans, ~{baud:.0f} baud)"
+                                                  if baud else "FSK/C4FM (Sayısal-Frekans)")
+                self._clf_result["analog_digital"] = "Sayısal"
+            elif r.get("is_digital") is False:
+                self._clf_result["modulation"] = "FM (Analog-Frekans)"
+                self._clf_result["analog_digital"] = "Analog"
+            # is_digital None -> "FM/FSK (Frekans Mod.)" olduğu gibi kalır (dürüstçe Ortak)
+        except Exception as exc:
+            self.log_signal.emit(f"Analog/Sayısal kesinleştirme atlandı: {exc}")
+
+    def _get_classify_snapshot(self, fallback_iq):
+        """Sınıflandırma için ring buffer'dan KAYIPSIZ uzun kayıt al (son 2048 yerine
+        CLASSIFY_SNAPSHOT_N örnek); yoksa canlı iq'ya düş. Uzun kayıt -> daha iyi frekans
+        çözünürlüğü + güvenilir OFDM CP otokorelasyonu + AMC. (Ring buffer mimarisinin meyvesi.)"""
+        if self.use_hardware and hasattr(self, 'engine') and hasattr(self.engine, 'get_snapshot'):
+            try:
+                snap = self.engine.get_snapshot(CLASSIFY_SNAPSHOT_N)
+                if snap is not None and len(snap) >= 4096:
+                    return snap
+            except Exception:
+                pass
+        return fallback_iq
+
+    def _service_look_through(self):
+        """ARABAKIŞLI KARIŞTIRMA — GERÇEK T/R ZAMAN-PAYLAŞIMI + KAPALI-ÇEVRİM (5.2.2).
+
+        Donanım TX'i, duty periyodunun yayın kısmında AÇIK, dinleme kısmında fiziksel olarak KAPALI
+        (set_tx_active False) -> dinleme penceresinde RX GERÇEK kanalı görür. Dinleme ölçümü
+        (_lt_present/_lt_bw_hz/_lt_peak_offset_hz, bkz. _run_signal_analysis) durum makinesini sürer:
+
+          * ENERJİ KAZANCI (kanalda sinyal): karıştırmayı SÜRDÜR (AKTİF); gücü tespit edilen banda
+            odakla — hedef offseti kayarsa TX tamponunu yeniden odaklı üret (dinamik BW takibi).
+          * ENERJİ KAYBI (yayın sonlandı): LOOK_THROUGH_ENDED_WINDOWS ardışık boş pencereden sonra
+            BEKLEME (STANDBY) — TX kapalı kalır, yalnızca periyodik dinleme sürer (sınırlı karıştırma
+            gücü boşa harcanmaz). Sinyal geri gelince (enerji kazancı) karıştırma otomatik sürdürülür.
+
+        Böylece 'karıştırma kaynaklarının verimli kullanılması' (temporal + spektral) sağlanır."""
+        if not (self.use_hardware and hasattr(self, 'engine')):
+            return
+        now = time.time()
+        period = max(LOOK_THROUGH_MIN_PERIOD_SEC, self.tx_params.get("look_time_ms", 300.0) / 1000.0)
+        duty = max(0.0, min(100.0, self.tx_params.get("duty_percent", 85.0))) / 100.0
+        on_dur = period * duty
+        off_dur = period * (1.0 - duty)
+        elapsed = now - getattr(self, "_lt_phase_start", now)
+
+        if getattr(self, "_lt_tx_on", True):
+            # Yayın (karıştırma) penceresi -> süresi dolunca dinlemeye geç: TX fiziksel KAPAT +
+            # RX AÇ (USB dinlemeye ayrılır, kanal ölçülür).
+            if elapsed >= on_dur:
+                self.engine.set_tx_active(False)
+                self._lt_set_rx(True)
+                self._lt_tx_on = False
+                self._lt_phase_start = now
+        else:
+            # KISA DİNLEME (peek) penceresi doldu -> HER ZAMAN karıştırmaya geri dön (SÜREKLİ
+            # bastırma). Operatör bu kanalı karıştırmayı seçti; peek yalnızca BİLGİ amaçlıdır:
+            # (a) ekranda gerçek kanalı göstermek, (b) hedef bandı ölçüp gücü oraya odaklamak (refocus).
+            #
+            # NOT (eski 'STANDBY' davranışı KALDIRILDI): peek'te hedef algılanmazsa 2 pencere sonra
+            # karıştırmayı DURDURUYORDU. Kısa peek ölçümü güvenilmez olduğunda (RX yeni açıldı) ya da
+            # hedef aralıklı (PTT) yayın yaptığında, jammer erkenden RX'e geçip TX'i kesiyordu
+            # -> operatör "TX çok kısa, hemen RX'e geçiyor" diyordu. Sürekli bastırma için kaldırıldı.
+            if elapsed >= off_dur:
+                if getattr(self, "_lt_present", False):
+                    self._lt_refocus_if_moved()   # hedef bandı kaydıysa gücü yeniden odakla
+                self._lt_empty_count = 0
+                self._lt_active = True
+                self._lt_set_rx(False)            # jam penceresi: RX KAPALI -> USB tamamen TX'te
+                self.engine.set_tx_active(True)
+                self._lt_tx_on = True
+                self._lt_phase_start = now
+
+    def _lt_set_rx(self, enabled: bool):
+        """Look-through T/R geçişinde RX akışını aç/kapat. Jam penceresinde RX KAPALI (USB tamamen
+        TX'te -> tam güç, underflow yok); dinleme penceresinde RX AÇIK (kanal ölçülür). Tekrarlı
+        aynı-durum çağrılarını (gereksiz stream toggle) elemek için son durumu hatırlar."""
+        if not (self.use_hardware and hasattr(self, 'engine') and hasattr(self.engine, 'set_rx_enabled')):
+            return
+        if getattr(self, "_lt_rx_on", None) == enabled:
+            return
+        self._lt_rx_on = enabled
+        self.engine.set_rx_enabled(enabled)
+
+    def _service_gnss_drift(self, period_s: float = 1.0):
+        """GNSS DYNAMIC_DRIFT: TX baseband'ini ~period_s'de bir yeniden üretir. _build_tx_buffer,
+        time_sec'i güncelleyip drift'li koordinatla yeni çok-sistem baseband üretir; donanıma yükler.
+        Böylece hedef konumu gerçekten kuzeye kayar (yalnızca looplanan sabit bloktan ibaret kalmaz)."""
+        now = time.time()
+        last = getattr(self, "_gnss_last_rebuild", 0.0)
+        if now - last < period_s:
+            return
+        self._gnss_last_rebuild = now
+        try:
+            self.tx_pre_gen = self._build_tx_buffer()
+            self._tx_sim_idx = 0
+            if self.use_hardware and hasattr(self, 'engine'):
+                self.engine.set_tx_buffer(self.tx_pre_gen)
+        except Exception as exc:
+            self.log_signal.emit(f"GNSS drift: baseband yenileme başarısız: {exc}")
+
+    def _lt_refocus_if_moved(self):
+        """Arabakış dinleme penceresinde ölçülen hedef bandı/offseti belirgin değiştiyse, TX
+        tamponunu yeni odakla YENİDEN üret ve donanıma yükle (gücü tespit edilen banda aktar, 5.2.2)."""
+        bw = float(getattr(self, "_lt_bw_hz", 0.0) or 0.0)
+        off = float(getattr(self, "_lt_peak_offset_hz", 0.0) or 0.0)
+        if not (0.0 < bw < 0.85 * self.sample_rate):
+            return
+        applied = getattr(self, "_lt_focus_applied", None)
+        moved = (applied is None
+                 or abs(off - applied[1]) > LOOK_THROUGH_REFOCUS_HZ
+                 or abs(bw - applied[0]) > max(0.3 * applied[0], LOOK_THROUGH_REFOCUS_HZ))
+        if not moved:
+            return
+        self.tx_params["focus_bw_hz"] = bw
+        self.tx_params["focus_offset_hz"] = off
+        try:
+            self.tx_pre_gen = self._build_tx_buffer()
+            self.engine.set_tx_buffer(self.tx_pre_gen)
+            self._lt_focus_applied = (bw, off)
+            self.log_signal.emit(f"ARABAKIŞ: güç yeniden odaklandı -> ~{bw/1e3:.0f} kHz "
+                                 f"@ {off/1e3:+.0f} kHz (tespit edilen banda).")
+        except Exception as exc:
+            self.log_signal.emit(f"ARABAKIŞ: yeniden odaklama başarısız: {exc}")
+
+    def _poll_stream_health(self, payload: dict):
+        """C++ akış-sağlığı sayaçlarını (RX overflow / stream error / TX underflow) Python'a
+        yansıtır. Sayaçlar C++'ta zaten tutuluyordu ama hiçbir yere aktarılmıyordu; artık
+        payload'a eklenir ve artış olduğunda operatöre loglanır (bulgu #6 tamamlayıcısı)."""
+        if not (self.use_hardware and hasattr(self, 'engine')):
+            return
+        try:
+            ov = int(self.engine.get_overflow_count())
+            se = int(self.engine.get_stream_error_count())
+            uf = int(self.engine.get_tx_underflow_count())
+        except Exception:
+            return
+        payload["rx_overflow"] = ov
+        payload["rx_stream_error"] = se
+        payload["tx_underflow"] = uf
+
+        now = time.time()
+        if (now - getattr(self, "_last_health_time", 0.0)) >= HEALTH_POLL_SEC:
+            prev = getattr(self, "_last_health", (0, 0, 0))
+            d_ov, d_se, d_uf = ov - prev[0], se - prev[1], uf - prev[2]
+            if d_ov or d_se or d_uf:
+                self.log_signal.emit(
+                    f"Backend: Akış sağlığı — RX overflow +{d_ov} (top {ov}), "
+                    f"stream hata +{d_se} (top {se}), TX underflow +{d_uf} (top {uf})")
+            self._last_health = (ov, se, uf)
+            self._last_health_time = now
+
+    def set_frequency(self, freq_mhz: float, quiet: bool = False):
+        self.center_freq_mhz = float(freq_mhz)
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.set_frequency(self.center_freq_mhz * 1e6)
+        if not quiet:
+            # Tarama (scan) sırasında her adımda log/DF-reset yapmak istemeyiz -> quiet=True.
+            self.hop_tracker.reset()      # bant değişti -> eski tepe-frekans geçmişi anlamsız
+            self.self_amp_df.reset()      # frekans değişti -> eski azimut-genlik haritası geçersiz
+            self.tuned_nf.reset()         # bant değişti -> tarihsel-min gürültü tabanı yeniden öğrenilmeli
+            self.moving_positioner.reset()  # yeni kaynak -> biriken (konum, kerteriz) örnekleri geçersiz
+            self._det_spectrum = None     # bant değişti -> zaman-ortalama sıfırlanmalı
+            self.log_signal.emit(f"Backend: Taşıyıcı Frekansı güncellendi -> {self.center_freq_mhz} MHz")
+
+    # ------------------------------------------------------------------ #
+    #  RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1)
+    # ------------------------------------------------------------------ #
+    def start_scan_rf(self, start_mhz: float, stop_mhz: float):
+        """Merkez frekansı [start, stop] aralığında süpürerek gürültü üstü sinyalleri otomatik
+        tespit etmeye başlar. Gerçek donanım gerektirir (sim'de tespit üretmez — sahte yok)."""
+        lo, hi = sorted((float(start_mhz), float(stop_mhz)))
+        lo = max(70.0, lo)
+        hi = min(6000.0, hi)
+        self.scan_start_mhz, self.scan_stop_mhz = lo, hi
+        self.scan_step_mhz = max(0.5, self.bandwidth_mhz * 0.9)   # pencereler örtüşecek şekilde adım
+        self.scan_cursor_mhz = lo
+        self.scan_detections = {}
+        self._nf_trackers = {}          # tarihsel-min gürültü tabanları sıfırlanır
+        self.set_frequency(lo, quiet=True)
+        self._scan_settle_until = time.time() + SCAN_SETTLE_SEC
+        self.scan_active = True
+        self.log_signal.emit(
+            f"🔍 BANT TARAMA BAŞLADI: {lo:.1f}–{hi:.1f} MHz (adım {self.scan_step_mhz:.1f} MHz, "
+            f"eşik gürültü+{SCAN_DETECT_DB:.0f} dB)")
+
+    def stop_scan_rf(self):
+        self.scan_active = False
+        self.log_signal.emit(f"⏹ Bant tarama durduruldu. Toplam {len(self.scan_detections)} sinyal tespit edildi.")
+
+    def _service_scan(self):
+        """Tarama adımı: mevcut pencerede (GERÇEK ölçülen FFT) gürültü üstü tepeleri tespit et,
+        birleştir/logla, sonra bir sonraki frekansa geç. Yalnızca donanımda çalışır."""
+        if not (self.use_hardware and hasattr(self, 'engine')):
+            return
+        now = time.time()
+        if now < self._scan_settle_until:
+            return   # retune sonrası oturma; bu pencerede tespit yapma (geçiş bozması olmasın)
+
+        fft = getattr(self, "_last_fft_dbm", None)
+        if fft is not None and len(fft) > 0:
+            # TARİHSEL-MİN gürültü tabanı (bu merkez frekans için) — self-masking'e bağışık (uzman #1)
+            ckey = round(self.center_freq_mhz * 10)
+            tracker = self._nf_trackers.setdefault(ckey, NoiseFloorTracker())
+            nf = tracker.update(fft)
+            # ADA/ENERJİ tespiti — dar + geniş bant birlikte, bant genişliğiyle (uzman #2)
+            for freq, pwr, snr, bw in self.dsp.detect_signals(
+                    fft, nf, self.center_freq_mhz, self.bandwidth_mhz, SCAN_DETECT_DB):
+                key = round(freq / SCAN_MERGE_MHZ)
+                prev = self.scan_detections.get(key)
+                if prev is None:
+                    self.scan_detections[key] = {"freq_mhz": freq, "power_dbfs": pwr,
+                                                 "snr_db": snr, "bw_mhz": bw, "ts": now, "count": 1}
+                    bw_str = f", BG ~{bw*1000:.0f} kHz" if bw < 1.0 else f", BG ~{bw:.1f} MHz"
+                    self.log_signal.emit(f"📡 TESPİT: {freq:.3f} MHz @ {pwr:.0f} dBFS (SNR {snr:.0f} dB{bw_str})")
+                    self.logger.log_detection(freq, pwr, snr)
+                else:
+                    prev["count"] += 1
+                    prev["ts"] = now
+                    if pwr > prev["power_dbfs"]:                 # MAX-HOLD: daha güçlü ölçümle güncelle
+                        prev.update(freq_mhz=freq, power_dbfs=pwr, snr_db=snr, bw_mhz=bw)
+            if len(self.scan_detections) > SCAN_MAX_DETECTIONS:  # en zayıfı at
+                weakest = min(self.scan_detections, key=lambda k: self.scan_detections[k]["power_dbfs"])
+                del self.scan_detections[weakest]
+
+        # Bir sonraki frekansa geç (sınıra ulaşınca başa sar -> sürekli izleme)
+        self.scan_cursor_mhz += self.scan_step_mhz
+        if self.scan_cursor_mhz > self.scan_stop_mhz:
+            self.scan_cursor_mhz = self.scan_start_mhz
+        self.set_frequency(self.scan_cursor_mhz, quiet=True)
+        self._scan_settle_until = now + SCAN_SETTLE_SEC
+
+    def set_gain(self, gain_db: float):
+        self.gain_db = float(gain_db)
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.set_gain(self.gain_db)
+        self.log_signal.emit(f"Backend: Güç Seviyesi (Gain) güncellendi -> {self.gain_db} dB")
+
+    def set_agc(self, enabled: bool):
+        self.agc_enabled = bool(enabled)
+        self.log_signal.emit(f"Backend: AGC (Otomatik Kazanç) {'AÇIK' if enabled else 'KAPALI'}.")
+
+    def _service_agc(self, peak_amp: float):
+        """OTOMATİK KAZANÇ KONTROLÜ (AGC): tepe genliği ADC doygunluğunun altında ideal bantta
+        tutar. Operatörün elle gain ayarlaması gerekmez (dinamik güç süpürmesi testinde kritik).
+        Histerezis + hız sınırı: kazanç en fazla AGC_INTERVAL_SEC'de bir değişir; doygunluğa
+        yakınken hızlı düşer, zayıf sinyalde yavaş yükselir. TX aktifken (self-reception) devre dışı."""
+        if not (self.agc_enabled and self.use_hardware and hasattr(self, 'engine')) or self.tx_active:
+            return
+        now = time.time()
+        # ACİL DÜŞÜŞ (SERT kırpma): telsiz PTT gibi ANİ güçlü darbede normal 3 dB/0.3s çok YAVAŞ —
+        # kazanç güvenliye inene dek 2+ s ADC doygun kalıp spektrumu harmonik/intermod tepeleriyle
+        # doldurur (±MHz her yerde sahte tepe). Sert kırpmada (tepe≥0.95) hız/adım sınırını ATLA:
+        # 0.1 s'de 10 dB düş -> kazanç ~0.3 s'de güvenliye iner, sahte tepeler hızla kaybolur.
+        if peak_amp >= 0.95 and self.gain_db > 0.0 and (now - self._last_agc_time) >= 0.1:
+            self.gain_db = float(np.clip(self.gain_db - 10.0, 0.0, RX_GAIN_MAX_DB))
+            self.engine.set_gain(self.gain_db)
+            self._last_agc_time = now
+            self.log_signal.emit(f"AGC ACİL: sert kırpma (tepe {peak_amp:.2f}) -> kazanç {self.gain_db:.0f} dB")
+            return
+        if (now - self._last_agc_time) < AGC_INTERVAL_SEC:
+            return
+        new_gain = None
+        if peak_amp >= AGC_CLIP_PEAK:                       # doygunluk yakın -> ACİL düşür
+            new_gain = self.gain_db - AGC_STEP_DOWN_DB
+        elif peak_amp > AGC_TARGET_HI:                      # biraz yüksek -> yavaş düşür
+            new_gain = self.gain_db - AGC_STEP_UP_DB
+        elif peak_amp < AGC_TARGET_LO and self.gain_db < AGC_HUNT_CEILING_DB:
+            # zayıf -> yükselt (ANCAK yükseliş tavanına kadar; sessizlikte 76 dB'ye tırmanıp
+            # PTT'de sert kırpma tuzağı kurmasın). Tavana ulaşınca daha fazla yükseltmez.
+            new_gain = min(self.gain_db + AGC_STEP_UP_DB, AGC_HUNT_CEILING_DB)
+        if new_gain is None:
+            return
+        new_gain = float(np.clip(new_gain, 0.0, RX_GAIN_MAX_DB))
+        if abs(new_gain - self.gain_db) < 0.1:              # sınırda -> değişiklik yok
+            return
+        self.gain_db = new_gain
+        self.engine.set_gain(self.gain_db)
+        self._last_agc_time = now
+        self.log_signal.emit(f"AGC: kazanç -> {self.gain_db:.0f} dB (tepe {peak_amp:.2f})")
+
+    def calibrate_power_dbm(self, known_dbm: float):
+        """MUTLAK GÜÇ KALİBRASYONU: sinyal jeneratörü BİLİNEN bir güç (known_dbm) yayınlarken
+        çağrılır. O anki ham IQ'dan ölçülen dBFS ile arasındaki ofset hesaplanıp kalıcı saklanır;
+        bundan sonra panelin gösterdiği güç gerçek dBm'e yakınsar. (Büyük test için kritik.)"""
+        with self.iq_lock:
+            iq = self.latest_iq.copy()
+        if self.use_hardware and hasattr(self, 'engine'):
+            try:
+                iq = self.engine.get_snapshot(CLASSIFY_SNAPSHOT_N)
+            except Exception:
+                pass
+        if iq is None or len(iq) < 64:
+            self.log_signal.emit("Backend: Kalibrasyon başarısız — yeterli IQ örneği yok.")
+            return
+        offset = self.dsp.calibrate_power(iq, float(known_dbm))
+        self.log_signal.emit(
+            f"Backend: GÜÇ KALİBRE EDİLDİ — referans {known_dbm:.1f} dBm -> ofset {offset:+.1f} dB "
+            f"(bundan sonra güçler mutlak dBm'e yakınsar).")
+
+    def set_power_cal_offset(self, offset_db: float):
+        """Kalibrasyon ofsetini elle ayarla (bilinen ofset varsa)."""
+        self.dsp.set_cal_offset(float(offset_db))
+        self.log_signal.emit(f"Backend: Güç kalibrasyon ofseti elle ayarlandı -> {offset_db:+.1f} dB")
+
+    def set_bandwidth(self, bw_mhz: float):
+        self.sample_rate = float(bw_mhz * 1e6)
+        # Spektrum ekseni ve waterfall genişliği bandwidth_mhz'i kullanır; örnekleme
+        # hızıyla senkron tutulmalı (aksi halde eksen yanlış ölçeklenir).
+        self.bandwidth_mhz = float(bw_mhz)
+        # Sinyal jeneratörleri yeni hıza göre baştan kurulmalı
+        self.jam_gen = JammingGenerator(sample_rate_hz=self.sample_rate)
+        self.gnss_gen = GNSSSpoofer(sample_rate_hz=self.sample_rate)
+        self.audio_demod = AudioDemodulator(sample_rate=self.sample_rate, audio_rate=48000)
+        self.classifier = SignalClassifier(sample_rate_hz=self.sample_rate)
+        # TX üreticisi yeni jeneratörlere/örnekleme hızına yeniden bağlanmalı
+        self.tx_builder = TxWaveformBuilder(self.jam_gen, self.gnss_gen, self.sample_rate)
+        self.hop_tracker.reset()   # örnekleme hızı değişti -> geçmiş anlamsız
+        self.self_amp_df.reset()   # örnekleme hızı değişti -> azimut-genlik haritası geçersiz
+
+        self.log_signal.emit(f"Backend: Bant Genişliği (Sample Rate) güncellendi -> {bw_mhz} MHz")
+
+        # YÜKSEK-HIZ RX UYARISI (kritik): B200mini USB'den yüksek örnekleme hızında sürekli RX,
+        # host DSP'si yetişemeyince taşmaya (overflow "O" seli) ve süreç OOM ile ÖLMESİNE yol açar.
+        # Dinleme/tespit için ~2.4 MHz fazlasıyla yeter (PMR kanalı 12.5 kHz). Yüksek BW YALNIZCA
+        # kısa geniş-bant TARAMA veya baraj JAMMING içindir. Operatörü net uyar (sessiz çökme olmasın).
+        if bw_mhz >= 10.0:
+            self.log_signal.emit(
+                f"⚠️ UYARI: {bw_mhz:.0f} MHz çok yüksek — bu hızda SÜREKLİ DİNLEME host'u boğar "
+                f"(overflow 'O' seli + program çökmesi/OOM). Telsiz/dinleme için Bant Genişliğini "
+                f"2.4 MHz yapın. Yüksek BW yalnızca kısa tarama veya baraj karıştırma içindir.")
+
+    def set_antenna(self, port_name: str):
+        self.antenna_port = port_name
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.set_antenna(self.antenna_port)
+        self.log_signal.emit(f"Backend: Anten Portu değiştirildi -> {port_name}")
+
+    def start_df_calibration(self, reference_deg: float):
+        """
+        Yön Bulma (DF) kalibrasyon modunu başlatır. Bilinen azimuttaki bir referans
+        (kalibrasyon) vericisi kullanılarak, SDR-1 kanalının ölçtüğü kerteriz ile
+        bu referans arasındaki RMS hata (Derece RMS, şartname 5.1.4) izlenir.
+        """
+        self.df_tracker.set_reference(reference_deg)
+        self.log_signal.emit(f"Backend: DF Kalibrasyonu başlatıldı -> Referans: {reference_deg:.1f}°")
+
+    def stop_df_calibration(self):
+        """DF kalibrasyon modunu kapatır."""
+        self.df_tracker.clear_reference()
+        self.log_signal.emit("Backend: DF Kalibrasyonu durduruldu.")
+
+    def stop(self):
+        self._is_running = False
+        # Ses oynatıcıyı durdur (hoparlör akışı + üretici thread)
+        self._stop_audio()
+        # GPS alıcı thread'ini kapat
+        if getattr(self, "gps", None) is not None:
+            self.gps.disconnect()
+        # TX aktifse ÖNCE güvenli kapat: aksi halde yayın sürer ve ET DURUMU "AKTİF" donar.
+        if self.tx_active:
+            self.tx_active = False
+            self.tx_params["mode"] = "NONE"
+            if self.use_hardware and hasattr(self, 'engine'):
+                self.engine.set_tx_active(False)
+        if self.udp_socket:
+            try:
+                self.udp_socket.close()
+            except OSError:
+                # Soket zaten kapalı/geçersiz olabilir; kapatma hatası kritik değil.
+                pass
+        self.wait()
+
+        # Donanımı güvenli kapatma
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.stop()
+
+        csv_path = self.logger.export_to_csv()
+        self.log_signal.emit(f"Operasyon tamamlandı. Görev raporu (CSV) oluşturuldu: {csv_path}")
+        self.logger.close()
+
+    def dump_raw_iq(self):
+        """Mevcut (en son) IQ buffer'ını diske kaydeder (Uzman Madde 7)"""
+        with self.iq_lock:
+            iq_copy = self.latest_iq.copy()
+        try:
+            filename = f"raw_iq_dump_{int(time.time())}.npy"
+            np.save(filename, iq_copy)
+            self.log_signal.emit(f"Hata Ayıklama (Debug): Ham IQ verisi kaydedildi -> {filename}")
+        except Exception as e:
+            self.log_signal.emit(f"Ham IQ kaydı başarısız: {e}")
+
+    # ------------------------------------------------------------- Ses (spec 5.1.3)
+    def _ensure_audio_player(self):
+        """Donanım çalışıyorsa AudioPlayer'ı (bir kez) oluşturur. Aksi halde None döner."""
+        if not (self.use_hardware and hasattr(self, "engine")):
+            return None
+        if self.audio_player is None:
+            from backend.audio_player import AudioPlayer
+            self.audio_player = AudioPlayer(self.engine, self.sample_rate, mode=self.audio_mode)
+        return self.audio_player
+
+    def set_audio_mode(self, mode: str):
+        """Demod modunu değiştir (FM/AM/USB/LSB). Oynatıcı yoksa yalnızca tercihi saklar."""
+        self.audio_mode = (mode or "FM").upper()
+        if self.audio_player is not None:
+            self.audio_player.set_mode(self.audio_mode)
+
+    def set_audio_listen(self, listen: bool) -> bool:
+        """Dinle/Sustur. Dinle: oynatıcıyı başlat + sesi aç. Döner: gerçekten dinleniyor mu."""
+        if listen:
+            player = self._ensure_audio_player()
+            if player is None:
+                self.log_signal.emit("Ses: Donanım aktif değil — önce alımı başlatın.")
+                return False
+            if not player.is_running():
+                if not player.start():
+                    self.log_signal.emit(f"Ses: Başlatılamadı ({player.last_error}).")
+                    return False
+            player.set_muted(False)
+            self.log_signal.emit(f"Ses: {self.audio_mode} demodülasyonu dinleniyor.")
+            return True
+        else:
+            if self.audio_player is not None:
+                self.audio_player.set_muted(True)
+            self.log_signal.emit("Ses: Susturuldu.")
+            return False
+
+    def set_digital_decode(self, enable: bool) -> dict:
+        """Sayısal amatör telsiz çözme (spec 5.1.3): 4FSK/C4FM tespiti + harici DSD-FME köprüsü.
+        Döner: {'enabled','dsd_available','hint'}. Donanım yoksa uyarır."""
+        if enable:
+            player = self._ensure_audio_player()
+            if player is None:
+                self.log_signal.emit("Sayısal ses: Donanım aktif değil — önce alımı başlatın.")
+                return {"enabled": False, "dsd_available": False, "hint": "donanım yok"}
+            if not player.is_running():
+                if not player.start():
+                    self.log_signal.emit(f"Sayısal ses: Başlatılamadı ({player.last_error}).")
+                    return {"enabled": False, "dsd_available": False, "hint": player.last_error or ""}
+            info = player.set_digital(True)
+            if info.get("dsd_available"):
+                self.log_signal.emit("Sayısal ses: DSD-FME ile çözülüyor (DMR/YSF/P25/NXDN).")
+            else:
+                self.log_signal.emit("Sayısal ses: DSD-FME kurulu değil — yalnızca 4FSK/C4FM tespiti aktif. "
+                                     + info.get("hint", ""))
+            return info
+        else:
+            if self.audio_player is not None:
+                self.audio_player.set_digital(False)
+            self.log_signal.emit("Sayısal ses: Kapatıldı.")
+            return {"enabled": False, "dsd_available": False, "hint": ""}
+
+    def _update_monitor(self, iq1, spectrum_info):
+        """Sinyal izleme (spec 5.1.3): ayarlı frekansa kilitlen; sürekliliği + parametre geçmişini
+        izle; kayıp/geri-gelme olaylarını logla. Tarama/TX sırasında askıya alınır."""
+        if self.scan_active or self.tx_active or not self.use_hardware:
+            return
+        now = time.time()
+        # Ayarlı frekansa (yeniden) kilitlen — kullanıcı frekans değiştirdiyse yeniden başla.
+        if (not self.monitor.is_locked() or self.monitor.locked_freq_mhz is None
+                or abs(self.monitor.locked_freq_mhz - self.center_freq_mhz) > 1e-6):
+            self.monitor.lock(self.center_freq_mhz)
+        snr = float(spectrum_info.get("snr_db", 0.0) or 0.0)
+        present = snr >= 6.0
+        carrier = (self.center_freq_mhz + self._last_peak_offset_hz / 1e6) if present else None
+        power = None
+        bw = None
+        if present:
+            try:
+                power = float(self.dsp.compute_channel_power_dbm(iq1))
+            except Exception:
+                power = None
+            bw = float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0)
+        event = self.monitor.update(now, present, carrier_mhz=carrier, power_dbm=power,
+                                    bw_hz=bw, snr_db=snr)
+        if event == "drop":
+            self.log_signal.emit(f"İzleme: {self.center_freq_mhz:.3f} MHz sinyali KAYBOLDU (kesinti).")
+        elif event == "reacquire":
+            self.log_signal.emit(f"İzleme: {self.center_freq_mhz:.3f} MHz sinyali GERİ GELDİ.")
+
+    def _stop_audio(self):
+        if self.audio_player is not None:
+            try:
+                self.audio_player.stop()
+            except Exception:
+                pass
+            self.audio_player = None
+
+    def set_df_mode(self, auto: bool):
+        self.is_auto_df = auto
+
+    def set_manual_angles(self, angles: tuple):
+        self.manual_angles = angles
+
+    def _udp_listener_loop(self):
+        """Uzak DF düğümlerinden (PlutoSDR + bilgisayar) ETHERNET/UDP üzerinden gelen JSON kerteriz
+        mesajlarını OTONOM dinler ve depoya işler. Beklenen şema (her düğüm periyodik gönderir):
+            {"id":"NODE-2","freq_mhz":433.9,"azimuth_deg":137.5,
+             "elevation_deg":12.0,"amp_dbm":-52.3,"snr_db":18.0}
+        Port 5005. Geçersiz/eksik mesajlar sessizce atlanır (kabul edilmez)."""
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.udp_socket.bind(("0.0.0.0", 5005))
+            self.udp_socket.settimeout(1.0)
+            while self._is_running:
+                try:
+                    data, _addr = self.udp_socket.recvfrom(2048)
+                    msg = json.loads(data.decode("utf-8"))
+                    if self.node_store.update_from_json(msg):
+                        pass  # kabul edildi (otonom işlendi)
+                except socket.timeout:
+                    continue
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                except OSError:
+                    break
+        except OSError as e:
+            self.log_signal.emit(f"Backend: UDP Listener başlatılamadı ({e})")
+        finally:
+            if self.udp_socket:
+                self.udp_socket.close()
+
+    def run(self):
+        self._is_running = True
+        self.start_time = time.time()
+        
+        # Her başlatmada logger bağlantısını yenile (Durdur/Başlat döngüsünde kapandığı için)
+        self.logger = MissionLogger(db_name="sdr_mission_logs.db")
+        
+        # Donanımı denemeye çalış (Yoksa False döner, simülasyon akar)
+        self.use_hardware = self._init_hardware()
+        
+        # Ağ Dinleyicisini Başlat
+        self.udp_thread = threading.Thread(target=self._udp_listener_loop, daemon=True)
+        self.udp_thread.start()
+        
+        # C++ SDR Motorunu başlat
+        if self.use_hardware and hasattr(self, 'engine'):
+            self.engine.start()
+            
+            # Gain Refresh: Akış başladıktan hemen sonra kazanç değerini tekrar gönder. 
+            # Böylece cihaz "sağır" kalmaz.
+            time.sleep(0.05) 
+            self.engine.set_gain(self.gain_db)
+            self.hardware_initialized = True
+        
+        self.log_signal.emit("SDR Worker Thread başlatıldı. Sinyal işleme aktif.")
+        self.status_signal.emit(True)
+
+        while self._is_running:
+            try:
+                loop_start = time.time()
+
+                start_freq = self.center_freq_mhz - (self.bandwidth_mhz / 2.0)
+                end_freq = self.center_freq_mhz + (self.bandwidth_mhz / 2.0)
+                x_freqs = np.linspace(start_freq, end_freq, FFT_POINTS)
+
+                # --- 1. I/Q SİNYAL OKUMA (MOTOR B - YALNIZCA DSP) ---
+                if self.use_hardware:
+                    if hasattr(self, 'engine'):
+                        iq1 = self.engine.get_latest_iq()
+                    else:
+                        with self.iq_lock:
+                            iq1 = self.latest_iq.copy()
+
+                    # --- ADC DOYGUNLUK (CLIPPING) TESPİTİ ---
+                    # ADC tam-skala genliği 1.0'dır. Gain çok yüksekse (ör. 70 dB, yoğun 2.4 GHz
+                    # ortamı) sinyal 1.0'ı aşar; ADC kırpılır. Kırpılan sinyal harmonik/intermod
+                    # üreterek TÜM bandı gürültüyle doldurur (spektrum "çim" görünür, tümsek kaybolur).
+                    # Bunu sessizce geçmek yerine operatörü uyarıp gain düşürmeye yönlendiriyoruz.
+                    peak_amp = float(np.max(np.abs(iq1))) if iq1.size else 0.0
+                    if peak_amp >= 0.98 and (time.time() - getattr(self, '_last_sat_warn', 0.0)) > 2.0:
+                        self.log_signal.emit(
+                            f"⚠️ ADC DOYGUNLUĞU! Tepe genlik={peak_amp:.2f} (>1.0 = kırpma). "
+                            f"Gain {self.gain_db:.0f} dB çok yüksek; spektrum harmoniklerle 'çim' gibi "
+                            f"dolar. Güç Seviyesini (Gain) düşürün (ör. 30-45 dB).")
+                        self._last_sat_warn = time.time()
+
+                    # OTOMATİK KAZANÇ KONTROLÜ: tepe genliği ideal (doygunluk-altı) bantta tut.
+                    self._service_agc(peak_amp)
+                    # NOT: Sentetik iq2/iq3 (sahte 3-kanal faz-DF) KALDIRILDI. DF artık gerçek:
+                    # yerel genlik-tabanlı kerteriz + uzak düğümlerden ağ (JSON) kerterizleri.
+                else:
+                    iq1 = np.full(FFT_POINTS, 1e-5, dtype=np.complex64)
+
+                    # Simülasyon modunda TX eklemesi: donanıma gönderilen GERÇEK baseband
+                    # tamponundan (moda özgü: baraj/ton/GNSS/analog/look-through) döngüsel
+                    # bir dilim ekleyerek spektrumda seçilen modun etkisini gösterir.
+                    if self.tx_active:
+                        tx_buf = getattr(self, 'tx_pre_gen', None)
+                        if tx_buf is not None and len(tx_buf) > 0:
+                            idx = getattr(self, '_tx_sim_idx', 0)
+                            tx_iq = np.take(tx_buf, np.arange(idx, idx + FFT_POINTS), mode='wrap')
+                            self._tx_sim_idx = (idx + FFT_POINTS) % len(tx_buf)
+                        else:
+                            target_amp = self.jam_gen.jsr_to_amplitude(self.tx_params["jsr_db"], signal_amplitude=1.0)
+                            tx_iq = self.jam_gen.generate_barrage_noise(FFT_POINTS, amplitude=target_amp)
+                        iq1 = iq1 + tx_iq.astype(np.complex64)
+
+                # --- 3. SİNYAL İŞLEME (DSP) + YÖN BULMA ---
+                # ARABAKIŞLI KARIŞTIRMA: gerçek T/R aç/kapa döngüsünü sür (bulgu #3). Dinleme
+                # penceresinde donanım TX'i fiziksel olarak kapanır; RX gerçek kanalı görür.
+                if self.tx_active and self.tx_params.get("mode") == "LOOK_THROUGH":
+                    self._service_look_through()
+
+                # GNSS DİNAMİK DRIFT: "Kuzeye sürekli kaydır" modu gerçekten kaysın diye TX tamponunu
+                # periyodik (~1 s) yeniden üret. Aksi halde buffer trigger anında bir kez üretilip
+                # loop'landığından hedef konumu sabit kalır (drift görünmez). MANUAL/AUTONOMOUS statiktir.
+                if (self.tx_active and self.tx_params.get("mode") == "GNSS_SPOOF"
+                        and self.tx_params.get("spoof_mode") == "DYNAMIC_DRIFT"):
+                    self._service_gnss_drift()
+
+                # RX SİNYAL ANALİZİ (spektrum + event-tetiklemeli sınıflandırma). God Object'i
+                # azaltmak için ayrı metoda taşındı; DF/nirengi (aşağıda) buna dokunmadan sürer.
+                fft_dbm, spectrum_info = self._run_signal_analysis(iq1)
+
+                # RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1): aktifse mevcut pencerede gerçek
+                # tepeleri yakala ve bir sonraki frekansa geç.
+                if self.scan_active:
+                    self._service_scan()
+
+                # --- GERÇEK YÖN BULMA + KONUM (genlik-tabanlı DF + 3B LOB üçgenleme) ---
+                # SNR geçidi için analiz sonucunu (spectrum_info) geçir: sinyal yokken genlik-DF
+                # haritası gürültüyle kirlenmesin (sıralı yayın senaryosu).
+                df = self._run_direction_finding(iq1, spectrum_info)
+                df_rms_deg = df["df_rms_deg"]
+                df_reference_deg = df["df_reference_deg"]
+
+                # Arayüz geriye-uyumluluğu: kayıt sırasına göre 3 düğüm kerterizi/genliği (yoksa 0)
+                node_ids = list(self.df_registry.keys())
+                _nodes = df["nodes"]
+                def _nb(i, key, default=0.0):
+                    if i < len(node_ids) and node_ids[i] in _nodes:
+                        return _nodes[node_ids[i]].get(key, default)
+                    return default
+                ang1_deg, ang2_deg, ang3_deg = (_nb(0, "azimuth_deg"), _nb(1, "azimuth_deg"), _nb(2, "azimuth_deg"))
+                amp1, amp2, amp3 = (_nb(0, "amp_dbm", -120.0), _nb(1, "amp_dbm", -120.0), _nb(2, "amp_dbm", -120.0))
+                # Konum: metre (ENU) -> arayüz ölçeği için km
+                target_x = round(df["position_xyz_m"][0] / 1000.0, 3)
+                target_y = round(df["position_xyz_m"][1] / 1000.0, 3)
+
+                # --- GERÇEK DSP SES DEMODÜLASYONU ---
+                audio_y = self.audio_demod.fm_demodulate(iq1, output_points=100)
+
+                # --- GÖREV/SİNYAL/DF LOGLAMA (~1 Hz) — God Object azaltma: ayrı metoda taşındı ---
+                self._do_periodic_logging(target_x, target_y, df, spectrum_info, ang1_deg)
+
+                # --- SİNYAL İZLEME/TAKİP (5.1.3): süreklilik + parametre geçmişi ---
+                self._update_monitor(iq1, spectrum_info)
+
+                # --- ANALOG/SAYISAL AYRIMI ---
+                # ŞİMDİLİK sadece AM/FM (analog) tespit ediyoruz; ikisi de ANALOG. Sınıflandırıcı
+                # sadece "AM.../FM..." veya "Sinyal yok/Belirlenemedi/Ölçülüyor" döndürür.
+                # (Dijital türler açılınca SAYISAL dalını geri ekleyin — bkz. signal_classifier._decide.)
+                mod_str = self._clf_result.get("modulation", "")
+                if any(s in mod_str for s in ("Sinyal yok", "Belirlenemedi", "Ölçülüyor")):
+                    ana_dig_tag = " (Sınıflandırılıyor...)"
+                elif "AM" in mod_str or "FM" in mod_str:
+                    ana_dig_tag = " [ANALOG KESİN]"
+                else:
+                    ana_dig_tag = ""
+
+                # --- 5. ARAYÜZE VERİ AKTARIMI ---
+                payload = {
+                    "x_freqs": x_freqs,
+                    "fft_dbm": fft_dbm,
+                    "audio_y": audio_y,
+                    "angles": (ang1_deg, ang2_deg, ang3_deg),
+                    "amps": (amp1, amp2, amp3),
+                    "target_pos": (target_x, target_y),
+                    "freq_bounds": (start_freq, end_freq),
+                    "df_rms_deg": df_rms_deg,
+                    "df_reference_deg": df_reference_deg,
+                    "df_sample_count": self.df_tracker.sample_count(),
+                    # GERÇEK DF/KONUM (3B LOB üçgenleme) — PPI ve düğüm izleme için
+                    "df_nodes": df["nodes"],
+                    "df_position_xyz_m": df["position_xyz_m"],
+                    "df_residual_m": df["residual_m"],
+                    "df_fix": df["fix"],
+                    "df_fix_quality_deg": df.get("fix_quality_deg", 0.0),   # LOB kesişim açısı (GDOP)
+                    "df_dimensionality": df.get("dimensionality", "-"),     # 2B (yer izdüşümü) / 3B
+                    "df_moving": df.get("moving"),                          # hareketli tek alıcı (GPS) konumu
+                    "df_active_count": df["active_count"],
+                    "df_remote_nodes": df.get("remote_nodes", []),   # uzak düğüm bağlantı durumu
+                    "df_self_bearing_deg": df["self_bearing_deg"],
+                    "df_target_bearing_deg": df["target_bearing_deg"],
+                    "df_target_range_m": df["target_range_m"],
+                    "df_target_elevation_deg": df["target_elevation_deg"],
+                    "bandwidth_mhz": self.bandwidth_mhz,
+                    "gain_db": self.gain_db,
+                    "agc_enabled": self.agc_enabled,
+                    "power_cal_offset_db": self.dsp.cal_offset_db,
+                    # RF bant tarama / sinyal tespiti (5.1.1) — tespit edilen sinyaller (frekans+güç+SNR)
+                    "scan_active": self.scan_active,
+                    "scan_detections": sorted(
+                        ({"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
+                          "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0)}
+                         for d in self.scan_detections.values()),
+                        key=lambda x: x["freq_mhz"]),
+                    "tx_active": self.tx_active,
+                    "tx_mode": self.tx_params["mode"] if self.tx_active else "NONE",
+                    # Arabakış (5.2.2) kapalı-çevrim durumu: karıştırma aktif mi yoksa (yayın sonlandı)
+                    # beklemede mi + tespit edilen hedef bandı
+                    "look_through": ({"jamming": bool(getattr(self, "_lt_active", True)),
+                                      "present": bool(getattr(self, "_lt_present", False)),
+                                      "bw_hz": float(getattr(self, "_lt_bw_hz", 0.0) or 0.0),
+                                      "offset_hz": float(getattr(self, "_lt_peak_offset_hz", 0.0) or 0.0)}
+                                     if (self.tx_active and self.tx_params.get("mode") == "LOOK_THROUGH")
+                                     else None),
+                    "ant_status": self.hw_ctrl.is_connected,
+                    # Gerçek ölçülen sinyal analizi (5.1.2)
+                    "occupied_bw_hz": spectrum_info["occupied_bw_hz"],
+                    "signal_class": spectrum_info["signal_class"] + ana_dig_tag,
+                    "spectral_flatness": spectrum_info["flatness"],
+                    "snr_db": spectrum_info["snr_db"],
+                    # Otomatik Modülasyon Sınıflandırma (Faz 1) + Çoklama (Faz 2)
+                    "modulation": self._clf_result["modulation"],
+                    "mod_confidence": self._clf_result["confidence"],
+                    "multiplex": self._clf_result.get("multiplex", "Belirlenemedi"),
+                    "ekkt": self._clf_result.get("ekkt", "Belirlenemedi"),
+                    "protocol": self._clf_result.get("protocol", "Belirlenemedi"),
+                    # Taşıyıcı frekansı (5.1.2): merkez + ölçülen tepe offseti (sinyal varken)
+                    "carrier_mhz": (round(self.center_freq_mhz + self._last_peak_offset_hz / 1e6, 4)
+                                    if float(spectrum_info.get("snr_db", 0.0) or 0.0) >= 6.0 else None),
+                    # Diğer sayısal özellikler (5.1.2): sembol/baud hızı
+                    "symbol_rate_hz": float(self._clf_result.get("symbol_rate_hz", 0.0) or 0.0),
+                    # Sinyal izleme/takip (5.1.3): süreklilik + parametre geçmişi özeti
+                    "monitor": self.monitor.status(),
+                    # Sayısal ses (5.1.3): 4FSK/C4FM tespit özeti (sayısal çözme aktifken)
+                    "digital_voice": (self.audio_player.get_last_fsk()
+                                      if (self.audio_player is not None
+                                          and self.audio_player.digital_enabled) else None),
+                }
+
+                # C++ akış-sağlığı sayaçlarını payload'a yansıt + artışları logla (bulgu #6 tamamlayıcısı)
+                self._poll_stream_health(payload)
+
+                # GUI'yi boğmamak için sadece 33ms (30 FPS) geçince veriyi gönder
+                # İşlemciyi boğmamak ve ekranı sabit FPS'te tutmak için bekleme
+                process_time = time.time() - loop_start
+                sleep_time = max(0.001, UPDATE_INTERVAL_SEC - process_time)
+                time.sleep(sleep_time)
+                # GUI BACKPRESSURE (kritik — donma/OOM önlemi): GUI thread'i önceki kareyi HENÜZ
+                # işlemediyse bu kareyi GÖNDERME (drop). Güçlü/sürekli sinyalde CPU doyunca GUI 30 FPS'i
+                # yetiştiremez; her kareyi kuyruğa atmak Qt olay kuyruğunu SINIRSIZ şişirir -> bellek
+                # tükenir ve süreç "Killed" (OOM) olur. Bu bayrak kuyruğu en fazla 1 bekleyen kareye
+                # sınırlar: GUI yavaşsa FPS düşer ama bellek sabit kalır (donma/çökme olmaz).
+                # WATCHDOG: GUI slot'u bir istisna atıp bayrağı geri açamazsa (ya da bir kare kaybolursa)
+                # bayrak sonsuza dek False kalıp GUI'yi tamamen dondurmasın; ~1 sn'dir onay gelmediyse
+                # GUI'yi hazır varsay ve akışı sürdür (en kötü ihtimalle 1 fazladan kare kuyruğa girer).
+                if not getattr(self, "_gui_ready", True) and (time.time() - getattr(self, "_last_gui_time", 0.0)) > 1.0:
+                    self._gui_ready = True
+                if getattr(self, "_gui_ready", True):
+                    self._gui_ready = False
+                    self.data_ready.emit(payload)
+                    self._last_gui_time = time.time()
+            except Exception as _loop_exc:
+                # KRİTİK DAYANIKLILIK: bir kareyi işlerken beklenmedik bir hata olursa worker
+                # QThread'ini ÖLDÜRME. Aksi halde run() sonlanır -> GUI'ye artık kare gelmez ->
+                # arayüz KALICI DONAR ve PyQt yakalanmamış exception'da uygulamayı ÇÖKERTİR
+                # (kullanıcı: 'grafiği 2-3 sn görüp sonra donuyor/çöküyor'). Hatayı logla, kısa
+                # bekle, sonraki kareye geç. Böylece tek bir kötü kare tüm sistemi düşürmez.
+                import traceback
+                traceback.print_exc()
+                try:
+                    self.log_signal.emit(f'⚠️ İşleme hatası (kare atlandı, sistem ayakta): {_loop_exc}')
+                except Exception:
+                    pass
+                self._gui_ready = True   # backpressure bayrağı kilitlenmesin
+                time.sleep(0.1)          # hata sağanağında CPU'yu boğma
+                
+        self.log_signal.emit("SDR Worker Thread durduruldu.")
+        self.status_signal.emit(False)
