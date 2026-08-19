@@ -8,8 +8,8 @@ donanımsız da açılıp test edilebilir. Aşağıdaki adımlar Linux (Ubuntu 2
 
 ## Adım 1: Depoyu Klonlama
 ```bash
-git clone https://github.com/ertugrulgms/xdxdxd.git
-cd xdxdxd
+git clone https://github.com/ertugrulgms/SDR-devices-user-interface.git
+cd SDR-devices-user-interface
 ```
 
 ## Adım 2: Sistem Bağımlılıkları (Donanım / C++ motoru için)
