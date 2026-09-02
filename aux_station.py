@@ -425,7 +425,8 @@ class AuxWorker(QThread):
             # 4) Merkeze kerteriz gönder (JSON/UDP) — hız sınırlı
             sent = False
             now = time.time()
-            if self.sending and bearing is not None and (now - self._last_send) >= (1.0 / self.cfg["rate_hz"]):
+            _rate_hz = self.cfg.get("rate_hz") or 10.0     # None/eksikse güvenli varsayılan (çökme yok)
+            if self.sending and bearing is not None and (now - self._last_send) >= (1.0 / _rate_hz):
                 msg = {
                     "id": self.cfg["id"],
                     "azimuth_deg": round(bearing, 2),
@@ -560,13 +561,14 @@ class AuxWindow(QMainWindow):
     def on_data(self, d):
         # Spektrum
         if self._x is None or len(self._x) != len(d["fft_dbm"]):
-            span_khz = (self.cfg["rate"] * 1e3)
+            span_khz = (self.cfg.get("rate") or 2.0) * 1e3   # None/eksikse güvenli varsayılan
             self._x = np.linspace(-span_khz / 2, span_khz / 2, len(d["fft_dbm"]))
         self.curve.setData(self._x, d["fft_dbm"])
 
-        # Büyük göstergeler
-        self.lbl_angle.setText(f"Açı: {d['azimuth']:.1f}°")
-        self.lbl_dbm.setText(f"dBm: {d['peak_dbm']:.1f}")
+        # Büyük göstergeler (None gelirse '—' göster, çökme)
+        _az = d.get("azimuth"); _pk = d.get("peak_dbm")
+        self.lbl_angle.setText(f"Açı: {_az:.1f}°" if _az is not None else "Açı: —")
+        self.lbl_dbm.setText(f"dBm: {_pk:.1f}" if _pk is not None else "dBm: —")
 
         # Kerteriz
         if d["bearing"] is not None:
