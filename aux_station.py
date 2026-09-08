@@ -143,10 +143,12 @@ class EncoderReader:
     def connect(self):
         if not _HAVE_SERIAL:
             return False
-        # OTOMATİK PORT: verilen portu önce dene, sonra aday portları (ESP32-S3 native USB ttyACM0/1;
-        # CH340/CP2102'li kart ttyUSB0). İlk AÇILAN porta bağlanır -> "yanlış port" sorunu çözülür.
+        # OTOMATİK PORT — SADECE 'ANGLE' verisi GELEN porta bağlan. ESP32-S3 native USB iki arayüz
+        # oluşturur (biri USB-Serial/JTAG, biri CDC); ANGLE çıkışı bunlardan yalnızca BİRİNDEDİR.
+        # Eskiden "açılan ilk porta" bağlanıyordu -> yanlış (sessiz) porta düşüp açı gelmiyordu.
+        # Her adayı açıp ~0.8s dinliyoruz; ANGLE gören porta bağlanır, gelmiyorsa sonrakini dener.
         import glob as _glob
-        cands = [self.port, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0'] + \
+        cands = [self.port, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0'] + \
                 sorted(_glob.glob('/dev/ttyACM*') + _glob.glob('/dev/ttyUSB*'))
         seen = set()
         for p in cands:
@@ -154,15 +156,31 @@ class EncoderReader:
                 continue
             seen.add(p)
             try:
-                self.conn = _pyserial.Serial(p, self.baud, timeout=1)
+                conn = _pyserial.Serial(p, self.baud, timeout=0.3)
+            except Exception:
+                continue
+            got = False
+            t0 = time.time()
+            while time.time() - t0 < 0.8:          # bu portta ANGLE geliyor mu?
+                try:
+                    line = conn.readline().decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    break
+                if line.startswith("ANGLE:"):
+                    got = True
+                    break
+            if got:
+                self.conn = conn
                 self.port = p
                 self.connected = True
                 self._running = True
                 self._thread = threading.Thread(target=self._loop, daemon=True)
                 self._thread.start()
                 return True
+            try:
+                conn.close()                        # ANGLE yok -> kapat, sonraki portu dene
             except Exception:
-                continue
+                pass
         self.connected = False
         return False
 
