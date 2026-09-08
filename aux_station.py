@@ -42,7 +42,7 @@ DEFAULTS = {
     "sdr": "driver=plutosdr",       # Pluto: "driver=plutosdr" | N210: "driver=uhd,addr=192.168.10.2"
     "host": "192.168.1.10",         # MERKEZ bilgisayarın IP'si (Cat6/statik)
     "port": 5005,                   # merkez UDP dinleme portu (sdr_panel ile aynı)
-    "enc": "/dev/ttyUSB0",          # ESP32 (AS5600 enkoder) seri portu
+    "enc": "/dev/ttyACM0",          # ESP32 (AS5600 enkoder) seri portu — ESP32-S3 native USB ttyACM0
     "baud": 115200,                 # ESP32 baud (mevcut firmware ile aynı)
     "freq": 433.0,                  # başlangıç hedef frekansı (MHz)
     "rate": 2.0,                    # örnekleme hızı (Msps)
@@ -87,7 +87,7 @@ class AmplitudeDF:
     Tepe etrafında güç-ağırlıklı dairesel merkez ile alt-derece hassasiyet. Örnekler zamanla söner
     (yeniden tarama / kaynak değişimi)."""
 
-    def __init__(self, bin_deg=1.0, window_deg=25.0, decay_sec=12.0):
+    def __init__(self, bin_deg=1.0, window_deg=25.0, decay_sec=15.0):
         self.bin_deg = bin_deg
         self.window_deg = window_deg
         self.decay_sec = decay_sec
@@ -589,9 +589,37 @@ class AuxWindow(QMainWindow):
         e.accept()
 
 
+def _auto_node_id():
+    """Kendi 192.168.1.x IP'sinden düğüm id'sini türet: .20 -> NODE-2, .30 -> NODE-3.
+    Böylece her yardımcı bilgisayar --id yazmadan sadece `python aux_station.py` ile çalışır
+    (statik IP'ler: ana=.10, NODE-2=.20, NODE-3=.30). Bulamazsa güvenli varsayılan NODE-2."""
+    ips = set()
+    try:  # merkez IP'ye UDP 'connect' -> paket GÖNDERMEZ, yalnızca yerel arayüzü/IP'yi seçer
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.168.1.10", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    try:  # hostname'e bağlı tüm IPv4 adresleri
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    for ip in ips:
+        if ip.startswith("192.168.1."):
+            last = ip.rsplit(".", 1)[-1]
+            if last == "20":
+                return "NODE-2"
+            if last == "30":
+                return "NODE-3"
+    return "NODE-2"
+
+
 def main():
     ap = argparse.ArgumentParser(description="DF Yardımcı İstasyon (Pluto / N210)")
-    ap.add_argument("--id", default=DEFAULTS["id"], help="Düğüm id (NODE-2/NODE-3) — merkezle aynı olmalı")
+    # --id verilmezse IP'den otomatik türetilir (.20->NODE-2, .30->NODE-3).
+    ap.add_argument("--id", default=None, help="Düğüm id (verilmezse IP'den otomatik: .20=NODE-2, .30=NODE-3)")
     ap.add_argument("--sdr", default=DEFAULTS["sdr"], help='SoapySDR args, ör. "driver=plutosdr" / "driver=uhd,addr=..."')
     ap.add_argument("--host", default=DEFAULTS["host"], help="Merkez bilgisayar IP")
     ap.add_argument("--port", type=int, default=DEFAULTS["port"])
@@ -602,7 +630,8 @@ def main():
     ap.add_argument("--gain", type=float, default=DEFAULTS["gain"], help="RX kazancı (dB)")
     ap.add_argument("--sim", action="store_true", help="Donanımsız simülasyon (arayüz testi)")
     a = ap.parse_args()
-    cfg = {"id": a.id, "sdr": a.sdr, "host": a.host, "port": a.port, "enc": a.enc, "baud": a.baud,
+    node_id = a.id if a.id else _auto_node_id()     # --id verilmediyse IP'den türet
+    cfg = {"id": node_id, "sdr": a.sdr, "host": a.host, "port": a.port, "enc": a.enc, "baud": a.baud,
            "freq": a.freq, "rate": a.rate, "gain": a.gain, "rate_hz": DEFAULTS["rate_hz"], "sim": a.sim}
 
     app = QApplication(sys.argv)
