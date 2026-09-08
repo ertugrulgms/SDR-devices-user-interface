@@ -143,16 +143,28 @@ class EncoderReader:
     def connect(self):
         if not _HAVE_SERIAL:
             return False
-        try:
-            self.conn = _pyserial.Serial(self.port, self.baud, timeout=1)
-            self.connected = True
-            self._running = True
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-            return True
-        except Exception:
-            self.connected = False
-            return False
+        # OTOMATİK PORT: verilen portu önce dene, sonra aday portları (ESP32-S3 native USB ttyACM0/1;
+        # CH340/CP2102'li kart ttyUSB0). İlk AÇILAN porta bağlanır -> "yanlış port" sorunu çözülür.
+        import glob as _glob
+        cands = [self.port, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0'] + \
+                sorted(_glob.glob('/dev/ttyACM*') + _glob.glob('/dev/ttyUSB*'))
+        seen = set()
+        for p in cands:
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            try:
+                self.conn = _pyserial.Serial(p, self.baud, timeout=1)
+                self.port = p
+                self.connected = True
+                self._running = True
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
+                return True
+            except Exception:
+                continue
+        self.connected = False
+        return False
 
     def _loop(self):
         while self._running and self.connected:
