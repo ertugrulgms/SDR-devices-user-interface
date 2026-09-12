@@ -60,7 +60,7 @@ class TxDialog(QDialog):
         
         layout_cont.addWidget(QLabel("Karıştırma Tipi:"))
         self.cmb_jam_type = QComboBox()
-        self.cmb_jam_type.addItems(["Tekli (Spot Gürültü)", "Çoklu (Multi-Tone)",
+        self.cmb_jam_type.addItems(["Tekli (Spot Gürültü)", "Çoklu (Çok-Bant Gürültü)",
                                     "Baraj (Barrage Noise)", "Süpürmeli (Frekans Tarama)"])
         layout_cont.addWidget(self.cmb_jam_type)
 
@@ -91,20 +91,68 @@ class TxDialog(QDialog):
         layout_inter = QVBoxLayout(tab_intermittent)
         layout_inter.setSpacing(14)
         
-        layout_inter.addWidget(QLabel("Aralıklı (Look-Through) Karıştırma Parametreleri:"))
-        layout_inter.addWidget(QLabel("Yayın Süresi (Duty Cycle %) — yüksek = daha uzun TX = daha güçlü jam:"))
-        self.txt_duty = QLineEdit("90")
-        self.txt_duty.setValidator(percent_val)
-        layout_inter.addWidget(self.txt_duty)
+        from PyQt6.QtWidgets import QCheckBox
+        sec_val = QDoubleValidator(0.5, 600.0, 1)      # süreler SANİYE cinsinden (ms değil)
 
-        layout_inter.addWidget(QLabel("Döngü Periyodu (ms) — aç/kapa döngüsü:"))
-        self.txt_look_time = QLineEdit("1000")
-        self.txt_look_time.setValidator(double_val)
-        layout_inter.addWidget(self.txt_look_time)
-        _hint = QLabel("KÜÇÜK periyot = cihaz ömrünü aç/kapa (ölü zaman) ile harcar -> jam gücü DİBE "
-                       "çakılır, LED strobe. BÜYÜK periyot + yüksek duty = uzun KESİNTİSİZ tam-güç jam.\n"
-                       "Donanım koruması için en az 500 ms uygulanır. Öneri: 1000–2000 ms, duty %90.\n"
-                       "Peek gerekmiyorsa maksimum güç için 'Sürekli Karıştırma' sekmesini kullan.")
+        layout_inter.addWidget(QLabel("Aralıklı (Look-Through) Karıştırma Parametreleri:"))
+
+        # KARIŞTIRMA FREKANSI — TX bu sekmede BAĞIMSIZ girilir (ana panel "Sinyal Al" frekansından
+        # etkilenmez). Oto-tarama açıksa hedef susunca [tarama başlangıç–bitiş] bandı taranır; bu alan
+        # başlangıç karıştırma frekansıdır. Sürekli/analog sekmeleriyle tutarlı.
+        layout_inter.addWidget(QLabel("Karıştırma Frekansı (MHz, 70–6000):"))
+        self.txt_lt_freq = QLineEdit("433.500")
+        self.txt_lt_freq.setValidator(QDoubleValidator(70.0, 6000.0, 3))
+        layout_inter.addWidget(self.txt_lt_freq)
+
+        # BANT GENİŞLİĞİ (MHz) — TX ekranından bağımsız (ana panelden değil). Jam + dinleme + tarama
+        # bu örnekleme hızında yapılır. Dar hedef için 2.4; geniş tarama için daha fazla.
+        layout_inter.addWidget(QLabel("Karıştırma/Tarama Bant Genişliği (MHz):"))
+        self.cmb_lt_bw = QComboBox()
+        self.cmb_lt_bw.addItems(["1.0", "2.0", "2.4", "4.0", "5.0", "10.0", "20.0", "30.0", "40.0", "50.0", "56.0", "61.44"])
+        self.cmb_lt_bw.setCurrentText("2.4")
+        layout_inter.addWidget(self.cmb_lt_bw)
+
+        # KARIŞTIRMA + DİNLEME süreleri — SANİYE cinsinden (5 sn jam / 2 sn dinle gibi)
+        row_t = QHBoxLayout()
+        col_jam = QVBoxLayout()
+        col_jam.addWidget(QLabel("Karıştırma Süresi (sn):"))
+        self.txt_jam_sec = QLineEdit("5")
+        self.txt_jam_sec.setValidator(sec_val)
+        col_jam.addWidget(self.txt_jam_sec)
+        row_t.addLayout(col_jam)
+        col_listen = QVBoxLayout()
+        col_listen.addWidget(QLabel("Dinleme Süresi (sn):"))
+        self.txt_listen_sec = QLineEdit("2")
+        self.txt_listen_sec.setValidator(sec_val)
+        col_listen.addWidget(self.txt_listen_sec)
+        row_t.addLayout(col_listen)
+        layout_inter.addLayout(row_t)
+
+        # OTOMATİK HEDEF TARAMA: hedef susunca band tarayıp yeni aktif frekans(lar) bul, sırayla ez
+        self.chk_lt_autoscan = QCheckBox("Hedef susunca bandı tara ve yeni hedefleri sırayla karıştır")
+        self.chk_lt_autoscan.setChecked(True)
+        self.chk_lt_autoscan.setStyleSheet("font-size:14px; color:#e0e0e0;")
+        layout_inter.addWidget(self.chk_lt_autoscan)
+
+        row_b = QHBoxLayout()
+        col_s = QVBoxLayout()
+        col_s.addWidget(QLabel("Jam Tarama Başlangıç (MHz):"))
+        self.txt_lt_scan_start = QLineEdit("430.0")
+        self.txt_lt_scan_start.setValidator(QDoubleValidator(70.0, 6000.0, 3))
+        col_s.addWidget(self.txt_lt_scan_start)
+        row_b.addLayout(col_s)
+        col_e = QVBoxLayout()
+        col_e.addWidget(QLabel("Jam Tarama Bitiş (MHz):"))
+        self.txt_lt_scan_stop = QLineEdit("440.0")
+        self.txt_lt_scan_stop.setValidator(QDoubleValidator(70.0, 6000.0, 3))
+        col_e.addWidget(self.txt_lt_scan_stop)
+        row_b.addLayout(col_e)
+        layout_inter.addLayout(row_b)
+
+        _hint = QLabel("Akış: KARIŞTIR (sn) → DİNLE (sn). Dinlemede hedef hâlâ yayındaysa ez; SUSTUYSA "
+                       "band taranır, bulunan aktif frekanslar SIRAYLA ezilir. Öneri: 5 sn jam / 2 sn dinle.\n"
+                       "Donanım koruması için süreler en az 0.5 sn uygulanır. Otomatik tarama kapalıysa "
+                       "yalnızca o anki frekans ezilir (klasik arabakış).")
         _hint.setStyleSheet("color:#9aa4b0; font-size:11px;")
         _hint.setWordWrap(True)
         layout_inter.addWidget(_hint)
@@ -122,6 +170,14 @@ class TxDialog(QDialog):
         self.txt_analog_freq = QLineEdit("446.00625")
         self.txt_analog_freq.setValidator(QDoubleValidator(70.0, 6000.0, 5))
         layout_analog.addWidget(self.txt_analog_freq)
+
+        # BANT GENİŞLİĞİ (MHz) — TX ekranından bağımsız. NBFM ses telsizi DAR-BANTTIR (~12.5 kHz kanal);
+        # düşük örnekleme (1-2 MHz) yeterli ve temizdir. Ana panelden bağımsız girilir.
+        layout_analog.addWidget(QLabel("Bant Genişliği (MHz):"))
+        self.cmb_analog_bw = QComboBox()
+        self.cmb_analog_bw.addItems(["1.0", "2.0", "2.4", "4.0", "5.0", "10.0", "20.0", "30.0", "40.0", "50.0", "56.0", "61.44"])
+        self.cmb_analog_bw.setCurrentText("2.0")
+        layout_analog.addWidget(self.cmb_analog_bw)
 
         layout_analog.addWidget(QLabel("Aldatma Sinyali Dalga Şekli:"))
         self.cmb_wave = QComboBox()
@@ -173,20 +229,37 @@ class TxDialog(QDialog):
         
         layout_gnss.addWidget(QLabel("GNSS Servisi (frekans otomatik ayarlanır):"))
         self.cmb_gnss_code = QComboBox()
+        # ŞİMDİLİK yalnızca ÜST L-BANDI servisleri (tek GNSS anteniyle kapsanır):
+        #   GPS L1 = 1575.42, GALILEO E1 = 1575.42 (aynı!), BEIDOU B1 = 1561.098 (~14 MHz yakın).
+        # Diğer servisler farklı frekanslarda (ayrı anten ister) -> ileride kullanmak için YORUMDA.
         self.cmb_gnss_code.addItems([
-            "GPS L1", "GPS L2", "GPS L5",
-            "GLONASS L1", "GLONASS L2", "GLONASS L3",
-            "GALILEO E1", "GALILEO E5a", "GALILEO E5b", "GALILEO E6",
-            "BEIDOU B1", "BEIDOU B2", "BEIDOU B3",
+            "GPS L1", "GALILEO E1", "BEIDOU B1",
+            # --- İLERİDE (ayrı anten/frekans gerektirir) — yorumdan çıkarınca geri gelir ---
+            # "GPS L2", "GPS L5",
+            # "GLONASS L1", "GLONASS L2", "GLONASS L3",
+            # "GALILEO E5a", "GALILEO E5b", "GALILEO E6",
+            # "BEIDOU B2", "BEIDOU B3",
         ])
         layout_gnss.addWidget(self.cmb_gnss_code)
-        
+
+        # BANT GENİŞLİĞİ (MHz) — TX ekranından bağımsız. Kendi üretecimizde servise göre önerilen:
+        # GPS L1 ~16, GALILEO E1 / BEIDOU B1 ~6 MHz. (GPS-SDR-SIM modunda otomatik 2.6 MHz'e zorlanır.)
+        layout_gnss.addWidget(QLabel("GNSS Bant Genişliği (MHz):"))
+        self.cmb_gnss_bw = QComboBox()
+        # Ana panel değerleri + GNSS'e özel 2.6 (GPS-SDR-SIM için gerekli)
+        self.cmb_gnss_bw.addItems(["2.6", "1.0", "2.0", "2.4", "4.0", "5.0", "10.0", "20.0", "30.0", "40.0", "50.0", "56.0", "61.44"])
+        self.cmb_gnss_bw.setCurrentText("2.6")
+        layout_gnss.addWidget(self.cmb_gnss_bw)
+
         layout_gnss.addWidget(QLabel("Spoofing Modu (Otonom veya Sabit):"))
         self.cmb_spoof_mode = QComboBox()
         self.cmb_spoof_mode.addItems([
             "MANUAL (Sabit Koordinata Kitle)",
             "AUTONOMOUS_RANDOM (Okyanusa Işınla)",
-            "DYNAMIC_DRIFT (Kuzeye Sürekli Kaydır)"
+            "DYNAMIC_DRIFT (Kuzeye Sürekli Kaydır)",
+            # Gerçek ephemeris'li GPS L1 (gerçek alıcıyı kandırır) — önce tools/gen_gps_spoof.py ile
+            # data/gpssim_l1.bin üret; SDR 2.6 MHz olmalı. Yalnızca GPS L1 servisinde geçerli.
+            "GPS-SDR-SIM L1 (gerçek ephemeris)",
         ])
         layout_gnss.addWidget(self.cmb_spoof_mode)
 
@@ -256,8 +329,13 @@ class TxDialog(QDialog):
             # JSR kaldırıldı: dijital sürüş tam-skalaya sabit (20 dB = tavan); güç yalnızca TX kazancı.
             "jsr_db": 20.0,
             "tx_gain_db": float(self.txt_tx_gain.text() or 80.0),
-            "duty_percent": float(self.txt_duty.text() or 90.0),
-            "look_time_ms": float(self.txt_look_time.text() or 1000.0),
+            # ARABAKIŞ süreleri — SANİYE cinsinden (ms değil). jam_sec: karıştırma, listen_sec: dinleme.
+            "jam_sec": float(self.txt_jam_sec.text() or 5.0),
+            "listen_sec": float(self.txt_listen_sec.text() or 2.0),
+            # Otomatik hedef tarama (hedef susunca bandı tara, yeni aktif frekansları sırayla ez)
+            "lt_auto_scan": bool(self.chk_lt_autoscan.isChecked()),
+            "lt_scan_start_mhz": float(self.txt_lt_scan_start.text() or 430.0),
+            "lt_scan_stop_mhz": float(self.txt_lt_scan_stop.text() or 440.0),
             "wave_type": self.cmb_wave.currentText(),
             "offset_ms": 12.0,   # sentetik dalgalar için sabit; WAV modunda kullanılmaz (UI alanı kaldırıldı)
             # Gerçek ses aldatma (5.2.3): WAV mesaj + hedefe uygun modülasyon/sapma + CTCSS tonu
@@ -293,11 +371,22 @@ class TxDialog(QDialog):
                    f"TX Güç: {tx_data['tx_gain_db']:.0f} dB")
         elif current_tab_idx == 1:
             tx_data["mode"] = "LOOK_THROUGH"
-            msg = f"ARALIKLI KARIŞTIRMA BAŞLATILDI -> Duty: %{tx_data['duty_percent']} | Dinleme: {tx_data['look_time_ms']} ms"
+            tx_data["tx_bw_mhz"] = float(self.cmb_lt_bw.currentText() or 2.4)   # TX ekranından bağımsız BW
+            # BAĞIMSIZ karıştırma frekansı (ana RX frekansından bağımsız). Worker bu frekansa geçer,
+            # arabakış ilk hedefi burası olur; autoscan açıksa hedef susunca tarama bandına geçilir.
+            tx_data["tx_freq_mhz"] = float(self.txt_lt_freq.text() or 433.5)
+            if tx_data["lt_auto_scan"]:
+                msg = (f"ARABAKIŞLI KARIŞTIRMA (OTO-TARAMA) -> Jam {tx_data['jam_sec']:.0f} sn / "
+                       f"Dinle {tx_data['listen_sec']:.0f} sn | Tarama: "
+                       f"{tx_data['lt_scan_start_mhz']:.1f}-{tx_data['lt_scan_stop_mhz']:.1f} MHz")
+            else:
+                msg = (f"ARABAKIŞLI KARIŞTIRMA -> Jam {tx_data['jam_sec']:.0f} sn / "
+                       f"Dinle {tx_data['listen_sec']:.0f} sn (tek frekans)")
         elif current_tab_idx == 2:
             tx_data["mode"] = "ANALOG_SPOOF"
             # Hedef telsiz frekansına geç (worker set_frequency uygular). Bu olmadan hedef duymaz.
             tx_data["tx_freq_mhz"] = float(self.txt_analog_freq.text() or 446.00625)
+            tx_data["tx_bw_mhz"] = float(self.cmb_analog_bw.currentText() or 2.0)   # TX ekranından bağımsız BW
             ctcss = "Yok" if self.cmb_ctcss.currentIndex() == 0 else f"{tx_data['decept_ctcss_hz']:.1f} Hz"
             msg = (f"ANALOG ALDATMA BAŞLATILDI -> Frekans: {tx_data['tx_freq_mhz']:.5f} MHz | "
                    f"Dalga: {tx_data['wave_type']} | Mod: {tx_data['decept_mod']} | "
@@ -305,7 +394,13 @@ class TxDialog(QDialog):
         elif current_tab_idx == 3:
             tx_data["mode"] = "GNSS_SPOOF"
             spoof_mode_text = self.cmb_spoof_mode.currentText()
-            if "RANDOM" in spoof_mode_text:
+            # BANT GENİŞLİĞİ TX ekranından (bağımsız). GPS-SDR-SIM'de 2.6 MHz'e ZORLANIR (dosya 2.6 Msps).
+            tx_data["tx_bw_mhz"] = float(self.cmb_gnss_bw.currentText() or 6.0)
+            if "GPS-SDR-SIM" in spoof_mode_text:
+                tx_data["spoof_mode"] = "GPSSDRSIM_L1"   # gerçek ephemeris baseband dosyası (GPS L1)
+                tx_data["gnss_code"] = "GPS L1"          # yalnızca GPS L1'de geçerli
+                tx_data["tx_bw_mhz"] = 2.6               # GPS-SDR-SIM 2.6 Msps -> BW zorla 2.6
+            elif "RANDOM" in spoof_mode_text:
                 tx_data["spoof_mode"] = "AUTONOMOUS_RANDOM"
             elif "DYNAMIC" in spoof_mode_text:
                 tx_data["spoof_mode"] = "DYNAMIC_DRIFT"

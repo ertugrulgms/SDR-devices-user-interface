@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                             QSlider, QDoubleSpinBox, QComboBox, QPushButton, QListWidget)
+                             QSlider, QDoubleSpinBox, QComboBox, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 class ControlPanel(QWidget):
@@ -167,14 +167,9 @@ class ControlPanel(QWidget):
         
         layout.addLayout(scan_row)
 
-        self.lbl_detections = QLabel("Tespit Edilen Sinyaller: 0")
-        self.lbl_detections.setStyleSheet("font-size: 14px; font-weight: bold; color: #ce93d8;")
-        layout.addWidget(self.lbl_detections)
-
-        self.detection_list = QListWidget()
-        self.detection_list.setMaximumHeight(80)
-        self.detection_list.setStyleSheet("font-family: monospace; font-size: 13px; background-color: #1a1420; color: #e0d0f0; border: 1px solid #4a2a5a; border-radius: 4px;")
-        layout.addWidget(self.detection_list)
+        # NOT: "Tespit Edilen Sinyaller" listesi ALT SATIRDAKİ DetectionPanel'e taşındı
+        # (ui/widgets/detection_panel.py) — orada daha geniş, ilk-görülme saatli, çift-tıkla-tune'lu
+        # ve CSV'ye aktarılabilir. Burada yalnızca tarama BUTONU ve aralık kutuları kalır.
 
         layout.addStretch(1)
 
@@ -200,12 +195,3 @@ class ControlPanel(QWidget):
             self.scan_btn.setText("BANT TARA (Sinyalleri Bul)")
             self.scan_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold; font-size: 16px; height: 40px; border-radius: 6px;")
 
-    def update_detections(self, detections: list):
-        """Tespit listesini güncelle: [{freq_mhz, power_dbfs, snr_db, bw_mhz}] (frekansa göre sıralı)."""
-        self.lbl_detections.setText(f"Tespit Edilen Sinyaller: {len(detections)}")
-        self.detection_list.clear()
-        for d in detections:
-            bw = d.get("bw_mhz", 0.0)
-            bw_str = f"{bw*1000:>5.0f} kHz" if 0 < bw < 1.0 else (f"{bw:>5.1f} MHz" if bw > 0 else "   —   ")
-            self.detection_list.addItem(
-                f"{d['freq_mhz']:>9.3f} MHz  {d['power_dbfs']:>5.0f} dBFS  SNR{d['snr_db']:>3.0f}  BG {bw_str}")

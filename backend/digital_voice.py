@@ -21,6 +21,7 @@ import shutil
 import socket
 import threading
 import subprocess
+from collections import deque
 import numpy as np
 
 
@@ -235,6 +236,12 @@ class DSDFMEDecoder:
     TCP_HOST = "127.0.0.1"
     TCP_PORT = 7355                     # DSD-FME '-i tcp' varsayılan portu (SDR++ uyumlu)
 
+    # DSD-FME'nin ÇÖZÜLEN VERİ satırlarında geçen anlamlı işaretler (sürüm-toleranslı). Bu işaretleri
+    # içeren satırlar "sayısal veri" olarak arayüze getirilir (5.1.3 "ses ve/veya VERİYE ulaşılması").
+    _DATA_MARKERS = ("Sync", "Color Code", "ColorCode", "CC=", "Talkgroup", "TG", "Target",
+                     "Source", "SRC", "Slot", "VOICE", "voice", "Call", "Group", "P25", "DMR",
+                     "YSF", "NXDN", "M17", "Site", "NAC", "RID", "Radio ID", "GPS", "LRRP")
+
     def __init__(self, audio_rate: int = 48000):
         self.audio_rate = int(audio_rate)
         self.binary = find_dsd_binary()
@@ -243,6 +250,9 @@ class DSDFMEDecoder:
         self._srv = None               # dinleyen soket (server=biz)
         self._conn = None              # kabul edilen client (dsd-fme)
         self._accept_thread = None
+        # ÇÖZÜLEN VERİ: DSD-FME stderr'ini okuyup anlamlı satırları biriktiren döngü (5.1.3 "veri").
+        self._data_lines = deque(maxlen=60)
+        self._stderr_thread = None
 
     def available(self) -> bool:
         return self.binary is not None
@@ -251,8 +261,11 @@ class DSDFMEDecoder:
         return ("DSD-FME kurulu değil. Sayısal ses (DMR/YSF/P25/NXDN) çözümü için: "
                 "tools/install_dsd_fme.sh çalıştırın (mbelib + dsd-fme derler).")
 
-    def start(self) -> bool:
-        """TCP server aç (7355) -> dsd-fme'yi '-i tcp -o pulse' ile başlat (client olarak bağlanır)."""
+    def start(self, bp_key: str = None) -> bool:
+        """TCP server aç (7355) -> dsd-fme'yi '-i tcp -o pulse' ile başlat (client olarak bağlanır).
+        bp_key verilirse (ondalık) DMR Basic Privacy anahtarı olarak eklenir ('-b <key>') -> şifreli
+        DMR yayını ÇÖZÜLÜR. Diğer şifre türleri (AES/RC4/Hytera...) için DSD_FME_CMD ile uygun bayrağı
+        (-H/-1/-A ...) verin."""
         if not self.available():
             self.last_error = "DSD-FME bulunamadı"
             return False
@@ -278,16 +291,29 @@ class DSDFMEDecoder:
         # 3) dsd-fme'yi başlat. Sürüm farkı olursa DSD_FME_CMD ile komutu değiştir
         #    (ör: export DSD_FME_CMD="dsd-fme -fa -i tcp:127.0.0.1:7355 -o pulse").
         override = os.environ.get("DSD_FME_CMD")
-        cmd = override.split() if override else [self.binary, "-fa", "-i", "tcp", "-o", "pulse"]
+        if override:
+            cmd = override.split()
+        else:
+            cmd = [self.binary, "-fa", "-i", "tcp", "-o", "pulse"]
+            # ŞİFRE ANAHTARI (DMR Basic Privacy, ondalık): girildiyse '-b <key>' ekle -> şifreli çözülür.
+            if bp_key not in (None, ""):
+                cmd += ["-b", str(bp_key).strip()]
         try:
+            # stderr=PIPE: DSD-FME çözüm satırlarını (sync/renk kodu/çağrı/TG...) buradan okur ve
+            # "sayısal veri" olarak arayüze getiririz (5.1.3 "veriye ulaşılması"). stdout DEVNULL.
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
+                stderr=subprocess.PIPE, bufsize=1, universal_newlines=True)
         except Exception as e:
             self.last_error = f"DSD-FME başlatılamadı: {e}"
             self._cleanup_sockets()
             self.proc = None
             return False
+
+        # stderr okuyucu thread: pipe'ı sürekli boşaltır (dolup DSD-FME'yi bloklamasın) + veri satırlarını biriktirir
+        self._data_lines.clear()
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+        self._stderr_thread.start()
 
         # 4) HEMEN KAPANDI MI? (yanlış bayrak/sürüm) -> dürüst hata
         time.sleep(0.6)
@@ -298,6 +324,29 @@ class DSDFMEDecoder:
             self.proc = None
             return False
         return True
+
+    def _stderr_loop(self):
+        """DSD-FME stderr'ini satır satır oku; ANLAMLI çözüm satırlarını (sync/renk kodu/çağrı/TG...)
+        biriktir. Sürüm-toleranslı: işaret içeren satırları alır, gerisini yutar (pipe'ı boşaltır)."""
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:      # process ölünce EOF -> döngü biter
+                s = line.strip()
+                if not s:
+                    continue
+                if any(m in s for m in self._DATA_MARKERS):
+                    self._data_lines.append(s[:160])   # aşırı uzun satırı kırp
+        except (ValueError, OSError):
+            pass
+
+    def get_recent_data(self, n: int = 6):
+        """Son çözülen VERİ satırları (en yeni sonda). Sayısal telsizden çözülen çağrı/sync/TG bilgisi.
+        Boş liste = henüz veri yok / kurulu değil (dürüst)."""
+        if not self._data_lines:
+            return []
+        return list(self._data_lines)[-int(max(1, n)):]
 
     def _accept_loop(self):
         """dsd-fme'nin TCP bağlantısını kabul et (tek client)."""

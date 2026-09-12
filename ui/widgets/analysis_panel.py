@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-                             QComboBox, QPushButton)
+                             QComboBox, QPushButton, QLineEdit)
 from PyQt6.QtCore import Qt, pyqtSignal
 import pyqtgraph as pg
 
@@ -107,6 +107,18 @@ class AnalysisPanel(QWidget):
             "QPushButton:checked{background:#6a1b9a;}")
         self.btn_digital.toggled.connect(self._on_digital_toggled)
         ctrl_row.addWidget(self.btn_digital)
+
+        # ŞİFRE ANAHTARI (opsiyonel, 5.1.3): ŞİFRELİ sayısal yayın için DMR Basic Privacy anahtarı
+        # (ondalık). BOŞ bırakılırsa hiçbir etkisi yok (şifresiz normal çözüm). Doldurulursa
+        # "Sayısal Çöz" o anahtarla dener -> şifreli yayın çözülür.
+        self.txt_decrypt_key = QLineEdit()
+        self.txt_decrypt_key.setPlaceholderText("Şifre anahtarı (varsa)")
+        self.txt_decrypt_key.setMaximumWidth(150)
+        self.txt_decrypt_key.setToolTip("ŞİFRELİ sayısal yayın için DMR Basic Privacy anahtarı (ondalık). "
+                                        "Boşsa şifresiz normal çözüm. Diğer şifre türleri için DSD_FME_CMD kullanın.")
+        self.txt_decrypt_key.setStyleSheet("font-size:13px; padding:4px; background:#333; color:#fff; "
+                                           "border:1px solid #555; border-radius:4px;")
+        ctrl_row.addWidget(self.txt_decrypt_key)
         ctrl_row.addStretch(1)
         layout.addLayout(ctrl_row)
 
@@ -124,7 +136,23 @@ class AnalysisPanel(QWidget):
         self.lbl_monitor.setWordWrap(True)
         layout.addWidget(self.lbl_monitor)
 
+        # SAYISAL VERİ (5.1.3): DSD-FME'den çözülen çağrı/sync/renk-kodu/TG satırları
+        self.lbl_digital_data = QLabel("")
+        self.lbl_digital_data.setStyleSheet("font-family: monospace; font-size: 13px; font-weight: bold; "
+                                            "color: #b39ddb;")
+        self.lbl_digital_data.setWordWrap(True)
+        self.lbl_digital_data.hide()
+        layout.addWidget(self.lbl_digital_data)
+
         layout.addStretch(1)
+
+    def update_digital_data(self, lines):
+        """Sayısal telsizden çözülen VERİ satırlarını göster (son birkaç satır). Boşsa gizle."""
+        if not lines:
+            self.lbl_digital_data.hide()
+            return
+        self.lbl_digital_data.show()
+        self.lbl_digital_data.setText("📟 Sayısal veri:\n" + "\n".join(lines[-4:]))
 
     def update_field(self, field_id: str, value: str):
         if field_id in self.analysis_data:
@@ -140,6 +168,10 @@ class AnalysisPanel(QWidget):
     def _on_digital_toggled(self, checked: bool):
         self.btn_digital.setText("📻 Sayısal Dur" if checked else "📻 Sayısal Çöz")
         self.audio_digital_toggled.emit(checked)
+
+    def get_decrypt_key(self) -> str:
+        """Girilen şifre anahtarı (ondalık) — boşsa "" (şifresiz normal çözüm)."""
+        return self.txt_decrypt_key.text().strip()
 
     def update_digital_voice(self, dv: dict):
         """4FSK/C4FM tespit özetini 'Diğer Sayısal Özellikler' alanında gösterir."""

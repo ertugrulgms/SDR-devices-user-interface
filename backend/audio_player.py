@@ -79,10 +79,10 @@ class AudioPlayer:
     def set_muted(self, muted: bool):
         self._muted = bool(muted)
 
-    def set_digital(self, enabled: bool) -> dict:
-        """Sayısal çözmeyi aç/kapat. Döner: {'enabled', 'dsd_available', 'hint'}.
-        DSD-FME kuruluysa çözülmüş sesi kendisi oynatır; kurulu değilse yalnızca 4FSK tespiti çalışır
-        (sahte ses ÜRETİLMEZ). Her iki durumda da last_fsk güncellenir."""
+    def set_digital(self, enabled: bool, key: str = None) -> dict:
+        """Sayısal çözmeyi aç/kapat. key verilirse (ondalık DMR Basic Privacy anahtarı) şifreli yayın
+        çözülür. Döner: {'enabled', 'dsd_available', 'hint'}. DSD-FME kuruluysa çözülmüş sesi kendisi
+        oynatır; kurulu değilse yalnızca 4FSK tespiti çalışır (sahte ses ÜRETİLMEZ)."""
         self.digital_enabled = bool(enabled)
         info = {"enabled": self.digital_enabled, "dsd_available": False, "hint": ""}
         if enabled:
@@ -91,7 +91,7 @@ class AudioPlayer:
             info["dsd_available"] = self.dsd.available()
             if self.dsd.available():
                 if not self.dsd.is_running():
-                    if not self.dsd.start():
+                    if not self.dsd.start(bp_key=key):
                         info["hint"] = self.dsd.last_error or "DSD-FME başlatılamadı"
             else:
                 info["hint"] = self.dsd.install_hint()
@@ -103,6 +103,13 @@ class AudioPlayer:
 
     def get_last_fsk(self) -> dict:
         return dict(self.last_fsk)
+
+    def get_digital_data(self, n: int = 6):
+        """DSD-FME'den ÇÖZÜLEN sayısal veri satırları (sync/renk kodu/çağrı/TG). Yoksa []
+        (5.1.3 'ses ve/veya veriye ulaşılması' — veri kısmı)."""
+        if self.dsd is not None and self.dsd.is_running():
+            return self.dsd.get_recent_data(n)
+        return []
 
     def is_muted(self) -> bool:
         return self._muted

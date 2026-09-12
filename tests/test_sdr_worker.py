@@ -187,15 +187,19 @@ class TestLookThroughClosedLoop(unittest.TestCase):
         self.w = SDRWorker()
         self.w.use_hardware = True
         self.w.engine = _FakeTxEngine()
-        self.w.trigger_tx({"mode": "LOOK_THROUGH", "duty_percent": 50.0, "look_time_ms": 20.0})
+        # KLASİK arabakış (oto-tarama KAPALI): tek frekans, sürekli bastırma. Oto-tarama açıkken
+        # hedef susunca band taranır (ayrı testler); bu sınıf klasik sürekli davranışı doğrular.
+        self.w.trigger_tx({"mode": "LOOK_THROUGH", "jam_sec": 5.0, "listen_sec": 2.0,
+                           "lt_auto_scan": False})
 
     def _advance(self, present, bw_hz=0.0, off_hz=0.0):
-        """Bir dinleme penceresini simüle et: ölçümü ayarla, pencere süresini geçir, servisi çağır."""
+        """Bir dinleme penceresini simüle et: durumu LISTEN yap, süresini geçir, servisi çağır."""
         self.w._lt_present = present
         self.w._lt_bw_hz = bw_hz
         self.w._lt_peak_offset_hz = off_hz
-        self.w._lt_tx_on = False                 # dinleme penceresindeyiz
-        self.w._lt_phase_start = 0.0             # süresi dolmuş say
+        self.w._lt_state = "LISTEN"              # dinleme penceresindeyiz
+        self.w._lt_tx_on = False
+        self.w._lt_phase_start = 0.0             # listen süresi dolmuş say
         self.w._service_look_through()
 
     def test_absent_target_keeps_jamming(self):

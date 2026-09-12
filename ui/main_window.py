@@ -7,7 +7,7 @@ import pyqtgraph as pg
 
 from backend.sdr_worker import SDRWorker
 from ui.widgets import (ControlPanel, AnalysisPanel, SpectrumWidget,
-                        DFPanel, PPIWidget, TxDialog)
+                        DFPanel, PPIWidget, TxDialog, DetectionPanel)
 
 FFT_POINTS = 2048
 WATERFALL_HISTORY = 100
@@ -85,10 +85,10 @@ class SDRMainWindow(QMainWindow):
         # Log Ekranı
         self.log_container = QWidget()
         log_layout = QVBoxLayout(self.log_container)
-        # Sistem logları SAĞDAN ~3cm içeri alındı (113px ≈ 3cm @96 DPI). Sadece log KENDİ İÇİNDE
-        # daralır; container genişliği (stretch=1) ve PPI (sabit 380) DEĞİŞMEZ -> başka yer etkilenmez.
-        # ESKİ DEĞER (geri dönüş için): setContentsMargins(0, 5, 0, 0)
-        log_layout.setContentsMargins(0, 5, 113, 0)
+        # Alt satır artık ÜÇ bölmeli: [loglar | tespit edilen sinyaller | radar]. Loglar yatayda
+        # yarıya indi (stretch=1 vs tespit paneli stretch=1) -> eski 113px sağ boşluğa gerek kalmadı.
+        # ESKİ DEĞER (geri dönüş için): setContentsMargins(0, 5, 113, 0)
+        log_layout.setContentsMargins(0, 5, 6, 0)
         
         from PyQt6.QtWidgets import QLabel
         self.lbl_log_title = QLabel("SİSTEM LOGLARI VE UYARILAR")
@@ -108,7 +108,13 @@ class SDRMainWindow(QMainWindow):
         self.ppi_widget.setFixedWidth(360)
         self.ppi_widget.setMaximumHeight(360)
 
+        # TESPİT EDİLEN SİNYALLER (5.1.1) — alt satırın ORTA bölmesi. Kontrol panelinden buraya taşındı:
+        # tarama sonuçları geniş/okunaklı görünür, çift tıkla o frekansa tune olunur, CSV'ye aktarılır.
+        self.detection_panel = DetectionPanel()
+
+        # Alt satır: [SİSTEM LOGLARI | TESPİT EDİLEN SİNYALLER | RADAR]
         bottom_layout.addWidget(self.log_container, stretch=1)
+        bottom_layout.addWidget(self.detection_panel, stretch=1)
         bottom_layout.addWidget(self.ppi_widget, stretch=0)
         bottom_layout.addSpacing(75)   # radar ~2cm SOLA kaydırıldı (sağına boşluk)
 
@@ -138,6 +144,10 @@ class SDRMainWindow(QMainWindow):
         self.control_panel.toggle_capture.connect(self.handle_capture_toggle)
         self.control_panel.open_tx_dialog.connect(self.open_tx_dialog)
         self.control_panel.scan_toggled.connect(self.handle_scan_toggle)
+        # Tespit paneli: çift tıkla -> o frekansa tune;  dışa aktarma -> log
+        self.detection_panel.tune_requested.connect(self.tune_to_detection)
+        self.detection_panel.exported.connect(
+            lambda p: self.add_log(f"📄 Tespit listesi dışa aktarıldı: {p}"))
 
         # DF Panel Sinyalleri
         self.df_panel.mode_changed.connect(self.toggle_df_mode)
@@ -154,8 +164,10 @@ class SDRMainWindow(QMainWindow):
         self.analysis_panel.audio_digital_toggled.connect(self.handle_audio_digital)
 
     def handle_audio_digital(self, enable: bool):
-        """Sayısal Çöz butonu. DSD-FME yoksa da 4FSK tespiti çalışır; durumu bildir."""
-        info = self.worker.set_digital_decode(enable)
+        """Sayısal Çöz butonu. DSD-FME yoksa da 4FSK tespiti çalışır; durumu bildir.
+        Şifre anahtarı alanı doluysa (ŞİFRELİ yayın) o anahtarla çözer."""
+        key = self.analysis_panel.get_decrypt_key() if enable else None
+        info = self.worker.set_digital_decode(enable, key=key or None)
         if enable and not info.get("enabled"):
             self.analysis_panel.btn_digital.blockSignals(True)
             self.analysis_panel.btn_digital.setChecked(False)
@@ -187,6 +199,15 @@ class SDRMainWindow(QMainWindow):
             
         dialog = TxDialog(self)
         dialog.tx_signal_started.connect(self.handle_tx_started)
+        # CTCSS OTOMATİK-TAŞIMA (5.2.3): dinlerken tespit edilen hedef CTCSS tonunu aldatma sekmesinde
+        # otomatik seç -> operatör tahmin etmez, hedefin ton-squelch'i garanti açılır.
+        ct = float(getattr(self, "_last_ctcss_hz", 0.0) or 0.0)
+        if ct > 0 and hasattr(dialog, "cmb_ctcss"):
+            for i in range(dialog.cmb_ctcss.count()):
+                txt = dialog.cmb_ctcss.itemText(i)
+                if txt and txt[0].isdigit() and abs(float(txt.split()[0]) - ct) < 0.3:
+                    dialog.cmb_ctcss.setCurrentIndex(i)
+                    break
         if dialog.exec() == QDialog.DialogCode.Accepted:
             if hasattr(dialog, 'tx_payload'):
                 payload = dialog.tx_payload
@@ -244,6 +265,13 @@ class SDRMainWindow(QMainWindow):
     def handle_debug_iq_clicked(self):
         if hasattr(self, 'worker'):
             self.worker.dump_raw_iq()
+
+    def tune_to_detection(self, freq_mhz: float):
+        """Tespit listesinde ÇİFT TIKLANAN sinyalin frekansına tune ol (5.1.1 -> 5.1.2 geçişi).
+        Frekans kutusunu ayarlamak yeterli: valueChanged -> freq_changed -> worker.set_frequency zinciri
+        zaten bağlı (elle yazma/yazım hatası olmadan hızlı geçiş)."""
+        self.control_panel.freq_input.setValue(float(freq_mhz))
+        self.add_log(f"🎯 Tespit edilen sinyale tune olundu: {freq_mhz:.3f} MHz")
 
     def apply_node_positions(self, polar_list):
         """DF panelinden gelen yardımcı düğüm konumlarını (mesafe m + pusula açısı°) worker'a uygula.
@@ -366,7 +394,7 @@ class SDRMainWindow(QMainWindow):
             self.spectrum_widget.update_spectrum(x_freqs, fft_dbm)
 
             # BANT TARAMA / SİNYAL TESPİTİ (5.1.1): tespit listesini + durumu güncelle
-            self.control_panel.update_detections(payload.get("scan_detections", []))
+            self.detection_panel.update_detections(payload.get("scan_detections", []))
             self.control_panel.set_scanning_state(payload.get("scan_active", False))
 
             peak_pwr = np.max(fft_dbm)
@@ -395,9 +423,23 @@ class SDRMainWindow(QMainWindow):
 
             # SAYISAL SES (5.1.3): 4FSK/C4FM tespit özeti
             self.analysis_panel.update_digital_voice(payload.get("digital_voice"))
+            # SAYISAL VERİ (5.1.3): DSD-FME'den çözülen çağrı/sync/renk-kodu/TG satırları
+            self.analysis_panel.update_digital_data(payload.get("digital_data"))
 
             if self.is_capturing:
-                occ_hz = payload.get("occupied_bw_hz", 0.0)
+                # KONSOLİDE PARAMETRELER (5.1.2): titrek ham değer yerine 3 sn çoğunluk/medyan +
+                # güven etiketi. Kategorik: "değer [KESİN/olası/zayıf %XX]". Sayısal: medyan.
+                pc = payload.get("params_consolidated", {}) or {}
+                def _cat(field, fallback):
+                    c = pc.get(field)
+                    if c and "value" in c:
+                        return f"{c['value']}  [{c['tier']} %{int(c['confidence'] * 100)}]"
+                    return fallback
+                def _num(field):
+                    c = pc.get(field)
+                    return c["value"] if (c and "value" in c) else None
+
+                occ_hz = _num("occupied_bw_hz") or payload.get("occupied_bw_hz", 0.0)
                 if occ_hz and occ_hz > 0:
                     occ_str = f"{occ_hz/1e6:.3f} MHz" if occ_hz >= 1e5 else f"{occ_hz/1e3:.1f} kHz"
                     self.analysis_panel.update_field("bandwidth", f"{occ_str} (işgal) / {payload['bandwidth_mhz']:.1f} MHz aralık")
@@ -417,31 +459,42 @@ class SDRMainWindow(QMainWindow):
                 else:
                     self.analysis_panel.update_field("signal_type", sig_class)
 
-                # Otomatik Modülasyon Sınıflandırma (Faz 1) — daha önce hep "Ölçülüyor..." kalan alan
-                mod = payload.get("modulation", "Ölçülüyor...")
-                mod_conf = payload.get("mod_confidence", 0.0)
-                if mod_conf and mod_conf > 0:
-                    self.analysis_panel.update_field("modulation", f"{mod}  [güven %{int(mod_conf * 100)}]")
-                else:
-                    self.analysis_panel.update_field("modulation", mod)
+                # CTCSS (5.2.3): tespit edilen alt-ses ton-squelch'i -> protokol alanında göster +
+                # sakla (TX aldatma sekmesine otomatik taşınır). Analog voice telsizin "protokolü".
+                self._last_ctcss_hz = float(payload.get("ctcss_hz", 0.0) or 0.0)
+
+                # Modülasyon (5.1.2): KONSOLİDE (çoğunluk oyu + güven etiketi) -> titremez, kararlı.
+                self.analysis_panel.update_field(
+                    "modulation", _cat("modulation", payload.get("modulation", "Ölçülüyor...")))
+
+                # Protokol: konsolide + (analog FM'de) tespit edilen squelch (CTCSS tonu / DCS kodu)
+                proto = _cat("protocol", payload.get("protocol", "Ölçülüyor..."))
+                if self._last_ctcss_hz > 0:
+                    proto = f"{proto}  |  🔉 CTCSS {self._last_ctcss_hz:.1f} Hz"
+                elif payload.get("squelch_type") == "DCS":
+                    proto = f"{proto}  |  🔉 DCS (kod yakalandı → aldatmaya hazır)"
 
                 # Çoklama Türü (5.1.2): OFDM / FDMA / DSSS-CDMA / TDMA / Tek Taşıyıcı
-                self.analysis_panel.update_field("multiplex", payload.get("multiplex", "Ölçülüyor..."))
+                self.analysis_panel.update_field(
+                    "multiplex", _cat("multiplex", payload.get("multiplex", "Ölçülüyor...")))
 
-                # EKKT Tedbiri (5.1.2): FHSS (frekans atlama) / DSSS (yayılı spektrum) / Yok
-                self.analysis_panel.update_field("ekkt", payload.get("ekkt", "Ölçülüyor..."))
+                # EKKT Tedbiri (5.1.2): FHSS / DSSS / Yok
+                self.analysis_panel.update_field(
+                    "ekkt", _cat("ekkt", payload.get("ekkt", "Ölçülüyor...")))
 
-                # Protokol Türü (5.1.2): bant planı + ölçülen özellikler -> olası protokol
-                self.analysis_panel.update_field("protocol", payload.get("protocol", "Ölçülüyor..."))
+                # Protokol Türü (5.1.2): bant planı + olası protokol + (analog FM'de) CTCSS tonu (5.2.3)
+                self.analysis_panel.update_field("protocol", proto)
 
-                # Taşıyıcı Frekansı (5.1.2): ölçülen tepe frekansı
-                carrier = payload.get("carrier_mhz")
+                # Taşıyıcı Frekansı (5.1.2): KONSOLİDE medyan (kararlı), yoksa ham tepe
+                carrier = _num("carrier_mhz")
+                if carrier is None:
+                    carrier = payload.get("carrier_mhz")
                 self.analysis_panel.update_field("carrier",
                     f"{carrier:.4f} MHz" if carrier is not None else "Sinyal yok / ölçülemedi")
 
                 # Diğer Sayısal Özellikler (5.1.2): sembol/baud hızı (dijitalde) — C4FM/4FSK özeti
                 # ayrıca update_digital_voice ile "digital" alanına yazılır.
-                baud = payload.get("symbol_rate_hz", 0.0) or 0.0
+                baud = _num("symbol_rate_hz") or payload.get("symbol_rate_hz", 0.0) or 0.0
                 if baud > 0:
                     self.analysis_panel.update_field("digital", f"Sembol hızı ≈ {baud/1e3:.1f} kBd")
 

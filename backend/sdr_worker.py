@@ -16,8 +16,9 @@ from backend.signal_monitor import SignalMonitor
 from backend.gps_receiver import GPSReceiver
 from backend.geo import geodetic_to_enu
 from backend.signal_classifier import SignalClassifier, HoppingHistoryTracker
+from backend.param_consolidator import ParameterConsolidator
 from backend.tx_engine import TxWaveformBuilder, WIFI_BAND_CENTERS, WAV_DECEPTION_WAVE
-from backend.audio_deception import load_wav_mono
+from backend.audio_deception import load_wav_mono, detect_ctcss, detect_dcs, extract_subaudio
 from backend.direction_finding import (NodeBearingStore, AmplitudeDFEstimator, azel_to_unit,
                                        triangulate_lob, bearing_from_positions,
                                        load_node_registry, self_node_id, MovingReceiverPositioner,
@@ -55,6 +56,7 @@ LOOK_THROUGH_SIGNAL_TH_DB = 10.0  # arabakış: tepe-taban farkı bu eşiğin ü
 LOOK_THROUGH_MIN_PERIOD_SEC = 0.5
 LOOK_THROUGH_ENDED_WINDOWS = 2    # arabakış: bu kadar ardışık BOŞ dinleme penceresi -> "yayın sonlandı"
 LOOK_THROUGH_REFOCUS_HZ = 60e3   # arabakış: hedef offseti bu kadar kayarsa gücü yeniden odakla (rebuild)
+LOOK_THROUGH_SCAN_SETTLE_SEC = 0.12  # arabakış oto-tarama: her retune sonrası RX oturma süresi
 HEALTH_POLL_SEC = 2.0             # C++ akış-sağlığı sayaçlarını raporlama periyodu
 # --- YÖN BULMA (şartname 5.1.4) ---
 DF_SIGNAL_PRESENT_DB = 6.0        # genlik-DF örneği YALNIZCA sinyal bu SNR'yi aşınca beslenir; aksi
@@ -172,6 +174,13 @@ class SDRWorker(QThread):
         self.classifier = SignalClassifier(sample_rate_hz=self.sample_rate)
         self._clf_result = {"modulation": "Ölçülüyor...", "confidence": 0.0}
         self._last_classify_time = 0.0
+        self._detected_ctcss_hz = 0.0     # analog FM CTCSS alt-ses tonu (aldatma için, 5.2.3)
+        self._squelch_type = None         # "CTCSS" / "DCS" / None (tespit edilen squelch türü)
+        self._squelch_subaudio = None     # DCS: yakalanan alt-ses kodu (aldatmada geri-oynatılır)
+        self._squelch_rate = 0.0
+        # PARAMETRE KONSOLİDATÖRÜ (5.1.2 stabilizasyon): ~2 Hz gürültülü sınıflandırmaları 3 sn
+        # penceresinde çoğunluk oyu + medyan ile KARARLI, güven-etiketli tek çıktıya indirger.
+        self.param_consol = ParameterConsolidator(window_sec=3.0)
         # FHSS zaman-geçmişi izleyici: her kare tepe-frekansı biriktirip zaman içinde atlama
         # tespit eder (tek-blok tespitinin fiziksel imkansızlığını çözer — uzman eleştirisi #1).
         self.hop_tracker = HoppingHistoryTracker(window_sec=2.0, min_snr_db=CLASSIFY_TRIGGER_DB)
@@ -221,8 +230,14 @@ class SDRWorker(QThread):
         self.tx_params = {
             "mode": "NONE",
             "jsr_db": 15.0,
-            "duty_percent": 75.0,
-            "look_time_ms": 50.0,
+            # ARABAKIŞ (saniye cinsinden) + otomatik hedef tarama varsayılanları.
+            # NOT: eski "duty_percent" / "look_time_ms" KALDIRILDI — arabakış artık yüzde/ms yerine
+            # doğrudan KARIŞTIRMA (jam_sec) ve DİNLEME (listen_sec) SANİYELERİ ile çalışır.
+            "jam_sec": 5.0,
+            "listen_sec": 2.0,
+            "lt_auto_scan": True,
+            "lt_scan_start_mhz": 430.0,
+            "lt_scan_stop_mhz": 440.0,
             "wave_type": "Sinüs Dalga (Tone)",
             "offset_ms": 12.0
         }
@@ -292,7 +307,24 @@ class SDRWorker(QThread):
         # Dinamik modlar (GNSS DYNAMIC_DRIFT vb.) için sürekli değişen zamana (time_sec) ihtiyaç var.
         # Motor ne kadar süredir çalışıyor:
         self.tx_params["time_sec"] = time.time() - getattr(self, "start_time", time.time())
-        
+
+        # GPS-SDR-SIM (gerçek ephemeris) GPS L1: önceden üretilen baseband dosyasını (tools/gen_gps_spoof.py)
+        # DOĞRUDAN yayınla -> gerçek alıcı sahte konuma kilitlenir. Kendi sentetik üretecimiz atlanır.
+        if (self.tx_params.get("mode") == "GNSS_SPOOF"
+                and self.tx_params.get("spoof_mode") == "GPSSDRSIM_L1"):
+            try:
+                from backend import gps_sdr_sim as _gss
+                _bin = self.tx_params.get("gpssim_bin") or os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "gpssim_l1.bin")
+                buf = _gss.load_baseband(_bin, iq_bits=16, amplitude=0.9)
+                self.log_signal.emit(f"Backend: GPS-SDR-SIM baseband yüklendi -> {_bin} "
+                                     f"({len(buf)} örnek, GERÇEK ephemeris, GPS L1)")
+                return buf
+            except Exception as exc:
+                self.log_signal.emit(f"⚠️ GPS-SDR-SIM baseband yüklenemedi ({exc}). "
+                                     f"Önce: python tools/gen_gps_spoof.py --rinex ... --lat ... --lon ...")
+                # düş: kendi sentetik GPS L1 üretecine geri dön
+
         buf, meta = self.tx_builder.build(self.tx_params)
         
         # NOT (KRİTİK DÜZELTME): C++ "otonom GNSS motoru" (update_gnss_sats -> gnss_active) DEVRE DIŞI.
@@ -345,6 +377,10 @@ class SDRWorker(QThread):
             if abs(self.center_freq_mhz - freq_mhz) > 1e-3:
                 self.set_frequency(freq_mhz)
             self.log_signal.emit(f"Backend: GNSS aldatma servisi -> {service} ({freq_mhz:.3f} MHz)")
+            # GPS-SDR-SIM (gerçek ephemeris): baseband 2.6 Msps üretilir -> SDR de 2.6 MHz olmalı.
+            if self.tx_params.get("spoof_mode") == "GPSSDRSIM_L1" and abs(self.sample_rate - 2.6e6) > 0.15e6:
+                self.log_signal.emit(f"⚠️ GPS-SDR-SIM: baseband 2.6 Msps'tir; Bant Genişliğini "
+                                     f"2.6 MHz yapıp yeniden başlatın (şu an {self.sample_rate/1e6:.2f} MHz).")
             # Servisin kod-oranı/BOC/FDMA'sının TEMİZ üretimi için önerilen örnekleme hızı. Çalışan
             # akışta örnekleme hızını değiştirmek UHD'yi çökertebildiği için OTOMATİK değiştirmiyoruz;
             # yetersizse operatörü uyarıyoruz (sinyal yine üretilir, ama düşük hızda aliaslanabilir).
@@ -365,6 +401,17 @@ class SDRWorker(QThread):
                 audio, arate = load_wav_mono(path)
                 self.tx_params["decept_audio"] = audio
                 self.tx_params["decept_audio_rate"] = arate
+                # SQUELCH OTOMATİK-TAŞIMA (5.2.3): CTCSS yoksa ama DCS tespit edildiyse, hedefin
+                # yakalanan alt-ses kodunu aldatmaya geçir (geri-oynatma -> kod-squelch açılır).
+                if (not self.tx_params.get("decept_ctcss_hz")
+                        and getattr(self, "_squelch_type", None) == "DCS"
+                        and getattr(self, "_squelch_subaudio", None) is not None):
+                    self.tx_params["decept_subaudio"] = self._squelch_subaudio
+                    self.tx_params["decept_subaudio_rate"] = float(getattr(self, "_squelch_rate", 0.0))
+                    self.log_signal.emit("Backend: Aldatma -> DCS alt-ses kodu geri-oynatılacak "
+                                         "(hedefin kod-squelch'i otomatik açılır).")
+                else:
+                    self.tx_params.pop("decept_subaudio", None)
                 dur = len(audio) / float(arate) if arate else 0.0
                 self.log_signal.emit(f"Backend: Aldatma ses mesajı yüklendi -> {path} "
                                      f"({dur:.1f} s, {arate} Hz, {self.tx_params.get('decept_mod','NBFM')})")
@@ -407,6 +454,14 @@ class SDRWorker(QThread):
         self._lt_empty_count = 0
         self._lt_bw_hz = 0.0
         self._lt_peak_offset_hz = 0.0
+        # OTOMATİK HEDEF TARAMA (round-robin) durumu — hedef susunca band tarayıp yeni aktif
+        # frekansları sırayla ez. state: "JAM" | "LISTEN" | "SCAN".
+        self._lt_state = "JAM"
+        self._lt_targets = [float(self.center_freq_mhz)]   # ilk hedef: operatörün ayarladığı frekans
+        self._lt_target_idx = 0
+        self._lt_scan_cursor = 0.0
+        self._lt_scan_hits = {}       # frekans -> güç (tarama sırasında biriken aktif frekanslar)
+        self._lt_scan_settle_until = 0.0
         # İlk odak, tetiklemedeki RX ölçümünden geldiyse onu uygulanmış say (gereksiz rebuild olmasın)
         _fb = self.tx_params.get("focus_bw_hz")
         self._lt_focus_applied = (float(_fb), float(self.tx_params.get("focus_offset_hz", 0.0))) if _fb else None
@@ -513,11 +568,15 @@ class SDRWorker(QThread):
                     self._lt_present = present
                     self._lt_peak_offset_hz = peak_off if present else 0.0
                     self._lt_bw_hz = occ_bw if present else 0.0
-                    if present:
+                    self._lt_snr_db = snr        # SCAN'de hedef gücünü sıralamak için (round-robin)
+                    if getattr(self, "_lt_state", "JAM") == "SCAN":
+                        sig_cls = (f"ARABAKIŞ [TARAMA]: {self.center_freq_mhz:.3f} MHz "
+                                   + (f"— sinyal VAR (SNR {snr:.0f} dB)" if present else "— boş"))
+                    elif present:
                         sig_cls = (f"ARABAKIŞ [enerji KAZANCI]: kanalda sinyal (SNR {snr:.0f} dB, "
                                    f"~{occ_bw/1e3:.0f} kHz @ {peak_off/1e3:+.0f} kHz)")
                     else:
-                        sig_cls = "ARABAKIŞ [enerji KAYBI]: kanal boş (yayın sonlandı) — karıştırma duraklatılıyor"
+                        sig_cls = "ARABAKIŞ [enerji KAYBI]: kanal boş (yayın sonlandı) — hedef aranıyor"
                     spectrum_info = {"occupied_bw_hz": occ_bw, "signal_class": sig_cls,
                                      "flatness": None, "snr_db": round(snr, 1)}
             else:
@@ -585,12 +644,28 @@ class SDRWorker(QThread):
                 self._clf_result["protocol"] = self.classifier.guess_protocol(
                     self.center_freq_mhz, self._clf_result)
                 self._last_classify_time = now
+                # KONSOLİDATÖRE BESLE (5.1.2 stabilizasyon): bu gerçek sınıflandırma karesini pencereye
+                # ekle. Taşıyıcı = merkez + ölçülen tepe offseti. Çoğunluk oyu + medyan payload'da alınır.
+                carrier = self.center_freq_mhz + float(getattr(self, "_last_peak_offset_hz", 0.0) or 0.0) / 1e6
+                self.param_consol.update({
+                    "modulation": self._clf_result.get("modulation"),
+                    "analog_digital": self._clf_result.get("analog_digital"),
+                    "multiplex": self._clf_result.get("multiplex"),
+                    "ekkt": self._clf_result.get("ekkt"),
+                    "protocol": self._clf_result.get("protocol"),
+                    "carrier_mhz": round(carrier, 4),
+                    "occupied_bw_hz": float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0),
+                    "symbol_rate_hz": float(self._clf_result.get("symbol_rate_hz", 0.0) or 0.0),
+                }, now)
         elif self.use_hardware:
-            # Sinyal eşik altına düştüğünde (örn. konuşma boşluğu/fading), yazının anında 
+            # Sinyal eşik altına düştüğünde (örn. konuşma boşluğu/fading), yazının anında
             # "Sinyal yok" olarak değişip titremesini (flickering) önlemek için 3 saniyelik "Hold Time"
             hold_time = 3.0
             if (now - self._last_valid_sig_time) > hold_time:
                 self._clf_result = {"modulation": "Sinyal yok (eşik altı)", "confidence": 0.0}
+                self.param_consol.reset()          # sinyal gitti -> pencereyi temizle (yeni kaynağa taşımasın)
+                self._detected_ctcss_hz = 0.0      # sinyal gitti -> CTCSS tespitini de temizle
+                self._squelch_type = None; self._squelch_subaudio = None
 
         # FHSS (frekans atlama — dijital EKKT) ÖRTÜŞÜ: zaman-geçmişi izleyicisi (HoppingHistoryTracker)
         # birçok ayrık kanal arasında sıçrama gördüyse, tek-blok AMC'nin üstüne EKKT=FHSS yaz. Bu,
@@ -844,6 +919,32 @@ class SDRWorker(QThread):
             elif r.get("is_digital") is False:
                 self._clf_result["modulation"] = "FM (Analog-Frekans)"
                 self._clf_result["analog_digital"] = "Analog"
+                # CTCSS TESPİTİ (5.2.3 için kritik): analog FM ayrımlayıcısından alt-ses ton-squelch'i
+                # tespit et. Aldatmada hedefin ton-squelch'ini AÇMAK için bu ton gerekir; operatörün
+                # tahmin etmesi yerine ölçülür ve aldatma sekmesine otomatik taşınır.
+                try:
+                    orate = self._refine_demod.out_rate
+                    c = detect_ctcss(disc, orate)
+                    if c.get("present") and c.get("ctcss_std_hz"):
+                        self._detected_ctcss_hz = float(c["ctcss_std_hz"])
+                        self._squelch_type = "CTCSS"
+                        self._squelch_subaudio = None
+                    else:
+                        self._detected_ctcss_hz = 0.0
+                        # CTCSS yok -> DCS mi? (dijital alt-ses akışı). Varsa GERÇEK alt-ses kodunu
+                        # yakala (aldatmada geri-oynatılır -> hedefin kod-squelch'i açılır).
+                        d = detect_dcs(disc, orate)
+                        if d.get("present"):
+                            self._squelch_type = "DCS"
+                            self._squelch_subaudio = extract_subaudio(disc, orate)[:int(orate * 0.5)]
+                            self._squelch_rate = float(orate)
+                        else:
+                            self._squelch_type = None
+                            self._squelch_subaudio = None
+                except Exception:
+                    self._detected_ctcss_hz = 0.0
+                    self._squelch_type = None
+                    self._squelch_subaudio = None
             # is_digital None -> "FM/FSK (Frekans Mod.)" olduğu gibi kalır (dürüstçe Ortak)
         except Exception as exc:
             self.log_signal.emit(f"Analog/Sayısal kesinleştirme atlandı: {exc}")
@@ -878,38 +979,120 @@ class SDRWorker(QThread):
         if not (self.use_hardware and hasattr(self, 'engine')):
             return
         now = time.time()
-        period = max(LOOK_THROUGH_MIN_PERIOD_SEC, self.tx_params.get("look_time_ms", 1000.0) / 1000.0)
-        duty = max(0.0, min(100.0, self.tx_params.get("duty_percent", 90.0))) / 100.0
-        on_dur = period * duty
-        off_dur = period * (1.0 - duty)
+        # Süreler SANİYE cinsinden (ms değil). Donanım koruması için taban LOOK_THROUGH_MIN_PERIOD_SEC.
+        jam_dur = max(LOOK_THROUGH_MIN_PERIOD_SEC, float(self.tx_params.get("jam_sec", 5.0)))
+        listen_dur = max(LOOK_THROUGH_MIN_PERIOD_SEC, float(self.tx_params.get("listen_sec", 2.0)))
+        auto_scan = bool(self.tx_params.get("lt_auto_scan", False))
+        state = getattr(self, "_lt_state", "JAM")
         elapsed = now - getattr(self, "_lt_phase_start", now)
 
-        if getattr(self, "_lt_tx_on", True):
-            # Yayın (karıştırma) penceresi -> süresi dolunca dinlemeye geç: TX fiziksel KAPAT +
-            # RX AÇ (USB dinlemeye ayrılır, kanal ölçülür).
-            if elapsed >= on_dur:
+        if state == "SCAN":
+            self._lt_scan_step(now)
+            return
+
+        if state == "JAM":
+            # KARIŞTIRMA penceresi (TX açık, RX kapalı). Süresi dolunca DİNLEME'ye geç.
+            if elapsed >= jam_dur:
                 self.engine.set_tx_active(False)
                 self._lt_set_rx(True)
                 self._lt_tx_on = False
+                self._lt_state = "LISTEN"
                 self._lt_phase_start = now
+            return
+
+        # state == "LISTEN": TX kapalı, RX açık -> hedef hâlâ yayında mı? (present, _run_signal_analysis'te ölçülür)
+        if elapsed < listen_dur:
+            return
+        present = bool(getattr(self, "_lt_present", False))
+
+        if not auto_scan:
+            # Klasik arabakış: tek frekans; hedef sussa da SÜREKLİ bastırma (operatör bu kanalı seçti).
+            if present:
+                self._lt_refocus_if_moved()
+            self._lt_resume_jam(now)
+            return
+
+        # OTO-TARAMA açık — round-robin hedef yönetimi:
+        if present:
+            self._lt_refocus_if_moved()                       # hedef konuşuyor -> güç odakla, sıradakine geç
+            self._lt_target_idx = (self._lt_target_idx + 1) % max(1, len(self._lt_targets))
         else:
-            # KISA DİNLEME (peek) penceresi doldu -> HER ZAMAN karıştırmaya geri dön (SÜREKLİ
-            # bastırma). Operatör bu kanalı karıştırmayı seçti; peek yalnızca BİLGİ amaçlıdır:
-            # (a) ekranda gerçek kanalı göstermek, (b) hedef bandı ölçüp gücü oraya odaklamak (refocus).
-            #
-            # NOT (eski 'STANDBY' davranışı KALDIRILDI): peek'te hedef algılanmazsa 2 pencere sonra
-            # karıştırmayı DURDURUYORDU. Kısa peek ölçümü güvenilmez olduğunda (RX yeni açıldı) ya da
-            # hedef aralıklı (PTT) yayın yaptığında, jammer erkenden RX'e geçip TX'i kesiyordu
-            # -> operatör "TX çok kısa, hemen RX'e geçiyor" diyordu. Sürekli bastırma için kaldırıldı.
-            if elapsed >= off_dur:
-                if getattr(self, "_lt_present", False):
-                    self._lt_refocus_if_moved()   # hedef bandı kaydıysa gücü yeniden odakla
-                self._lt_empty_count = 0
-                self._lt_active = True
-                self._lt_set_rx(False)            # jam penceresi: RX KAPALI -> USB tamamen TX'te
-                self.engine.set_tx_active(True)
-                self._lt_tx_on = True
-                self._lt_phase_start = now
+            # Hedef sustu -> listeden DÜŞÜR (kalan öğe idx'e kayar, yani idx zaten sonrakini gösterir).
+            if 0 <= self._lt_target_idx < len(self._lt_targets):
+                dropped = self._lt_targets.pop(self._lt_target_idx)
+                self.log_signal.emit(f"Arabakış: {dropped:.3f} MHz sustu -> hedeften düşürüldü.")
+            if self._lt_targets:
+                self._lt_target_idx %= len(self._lt_targets)
+
+        if self._lt_targets:
+            nxt = self._lt_targets[self._lt_target_idx]
+            if abs(nxt - self.center_freq_mhz) > 1e-6:
+                self.set_frequency(nxt, quiet=True)
+                self.log_signal.emit(f"Arabakış: sıradaki hedef {nxt:.3f} MHz -> karıştırılıyor.")
+            self._lt_resume_jam(now)
+        else:
+            self._lt_begin_scan(now)                          # bilinen hedef kalmadı -> band tara
+
+    def _lt_resume_jam(self, now):
+        """Karıştırma penceresine (JAM) dön: RX kapat, TX aç."""
+        self._lt_empty_count = 0
+        self._lt_active = True
+        self._lt_set_rx(False)                # RX KAPALI -> USB tamamen TX'te (tam güç)
+        self.engine.set_tx_active(True)
+        self._lt_tx_on = True
+        self._lt_state = "JAM"
+        self._lt_phase_start = now
+
+    def _lt_begin_scan(self, now):
+        """SCAN durumuna geç: jam kapalı, RX açık; [start,stop] bandını süpürerek aktif frekans ara."""
+        self.engine.set_tx_active(False)
+        self._lt_set_rx(True)
+        self._lt_tx_on = False
+        self._lt_active = False          # tarama sırasında karıştırma DURAKLI (payload/arayüz için)
+        self._lt_state = "SCAN"
+        self._lt_scan_hits = {}
+        self._lt_scan_cursor = float(self.tx_params.get("lt_scan_start_mhz", 430.0))
+        self.set_frequency(self._lt_scan_cursor, quiet=True)
+        self._lt_scan_settle_until = now + LOOK_THROUGH_SCAN_SETTLE_SEC
+        self.log_signal.emit("Arabakış: aktif hedef kalmadı -> band taranıyor (yeni hedef aranıyor)...")
+
+    def _lt_scan_step(self, now):
+        """SCAN adımı: her retune sonrası oturmayı bekle, dinleme ölçümünden (present/peak) aktif
+        frekansı kaydet, sonraki adıma geç. Band bitince hedef listesini kurup (güce göre) JAM'e döner."""
+        if now < getattr(self, "_lt_scan_settle_until", 0.0):
+            return
+        # Bu center'da sinyal var mı? (_run_signal_analysis dinleme dalı _lt_present/offset/snr'ı güncelledi)
+        if bool(getattr(self, "_lt_present", False)):
+            f_hit = self.center_freq_mhz + float(getattr(self, "_lt_peak_offset_hz", 0.0)) / 1e6
+            snr = float(getattr(self, "_lt_snr_db", 0.0) or 0.0)
+            key = round(f_hit / SCAN_MERGE_MHZ)
+            prev = self._lt_scan_hits.get(key)
+            if prev is None or snr > prev[1]:
+                self._lt_scan_hits[key] = (f_hit, snr)
+
+        step = max(0.5, self.bandwidth_mhz * 0.8)     # pencereler hafif örtüşsün (kaçak olmasın)
+        self._lt_scan_cursor += step
+        stop = float(self.tx_params.get("lt_scan_stop_mhz", 440.0))
+        if self._lt_scan_cursor > stop:
+            # Tarama bitti -> aktif hedefleri GÜCE göre (azalan) sırala; round-robin listesi kur.
+            hits = sorted(self._lt_scan_hits.values(), key=lambda t: -t[1])
+            self._lt_targets = [round(f, 4) for (f, s) in hits]
+            self._lt_target_idx = 0
+            if self._lt_targets:
+                self.log_signal.emit(
+                    f"Arabakış: {len(self._lt_targets)} aktif hedef bulundu -> sırayla karıştırılıyor "
+                    f"({', '.join(f'{f:.3f}' for f in self._lt_targets[:5])}{'...' if len(self._lt_targets) > 5 else ''} MHz).")
+                self.set_frequency(self._lt_targets[0], quiet=True)
+                self._lt_resume_jam(now)
+            else:
+                # Hiç aktif frekans yok -> baştan tekrar tara (beklemede; TX kapalı, güç boşa gitmez).
+                self._lt_scan_hits = {}
+                self._lt_scan_cursor = float(self.tx_params.get("lt_scan_start_mhz", 430.0))
+                self.set_frequency(self._lt_scan_cursor, quiet=True)
+                self._lt_scan_settle_until = now + LOOK_THROUGH_SCAN_SETTLE_SEC
+            return
+        self.set_frequency(self._lt_scan_cursor, quiet=True)
+        self._lt_scan_settle_until = now + LOOK_THROUGH_SCAN_SETTLE_SEC
 
     def _lt_set_rx(self, enabled: bool):
         """Look-through T/R geçişinde RX akışını aç/kapat. Jam penceresinde RX KAPALI (USB tamamen
@@ -1001,6 +1184,10 @@ class SDRWorker(QThread):
             self.tuned_nf.reset()         # bant değişti -> tarihsel-min gürültü tabanı yeniden öğrenilmeli
             self.moving_positioner.reset()  # yeni kaynak -> biriken (konum, kerteriz) örnekleri geçersiz
             self._det_spectrum = None     # bant değişti -> zaman-ortalama sıfırlanmalı
+            if hasattr(self, "param_consol"):
+                self.param_consol.reset()   # yeni frekans = yeni kaynak -> parametre penceresini temizle
+            self._detected_ctcss_hz = 0.0   # yeni kaynak -> CTCSS/DCS tespitini temizle
+            self._squelch_type = None; self._squelch_subaudio = None
             self.log_signal.emit(f"Backend: Taşıyıcı Frekansı güncellendi -> {self.center_freq_mhz} MHz")
 
     # ------------------------------------------------------------------ #
@@ -1051,8 +1238,11 @@ class SDRWorker(QThread):
                 key = round(freq / SCAN_MERGE_MHZ)
                 prev = self.scan_detections.get(key)
                 if prev is None:
+                    # first_ts = İLK GÖRÜLME anı (ts ise son görülme). Sıralı yayında kaynakların
+                    # hangi SIRAYLA açıldığını arayüzde göstermek için kalıcı olarak saklanır.
                     self.scan_detections[key] = {"freq_mhz": freq, "power_dbfs": pwr,
-                                                 "snr_db": snr, "bw_mhz": bw, "ts": now, "count": 1}
+                                                 "snr_db": snr, "bw_mhz": bw, "ts": now,
+                                                 "first_ts": now, "count": 1}
                     bw_str = f", BG ~{bw*1000:.0f} kHz" if bw < 1.0 else f", BG ~{bw:.1f} MHz"
                     self.log_signal.emit(f"📡 TESPİT: {freq:.3f} MHz @ {pwr:.0f} dBFS (SNR {snr:.0f} dB{bw_str})")
                     self.logger.log_detection(freq, pwr, snr)
@@ -1297,8 +1487,9 @@ class SDRWorker(QThread):
             self.log_signal.emit("Ses: Susturuldu.")
             return False
 
-    def set_digital_decode(self, enable: bool) -> dict:
+    def set_digital_decode(self, enable: bool, key: str = None) -> dict:
         """Sayısal amatör telsiz çözme (spec 5.1.3): 4FSK/C4FM tespiti + harici DSD-FME köprüsü.
+        key verilirse (ondalık DMR Basic Privacy anahtarı) ŞİFRELİ yayın çözülür.
         Döner: {'enabled','dsd_available','hint'}. Donanım yoksa uyarır."""
         if enable:
             player = self._ensure_audio_player()
@@ -1309,9 +1500,10 @@ class SDRWorker(QThread):
                 if not player.start():
                     self.log_signal.emit(f"Sayısal ses: Başlatılamadı ({player.last_error}).")
                     return {"enabled": False, "dsd_available": False, "hint": player.last_error or ""}
-            info = player.set_digital(True)
+            info = player.set_digital(True, key=key)
             if info.get("dsd_available"):
-                self.log_signal.emit("Sayısal ses: DSD-FME ile çözülüyor (DMR/YSF/P25/NXDN).")
+                self.log_signal.emit("Sayısal ses: DSD-FME ile çözülüyor (DMR/YSF/P25/NXDN)."
+                                     + (f" [şifre anahtarı: {key}]" if key else ""))
             else:
                 self.log_signal.emit("Sayısal ses: DSD-FME kurulu değil — yalnızca 4FSK/C4FM tespiti aktif. "
                                      + info.get("hint", ""))
@@ -1571,7 +1763,8 @@ class SDRWorker(QThread):
                     "scan_active": self.scan_active,
                     "scan_detections": sorted(
                         ({"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
-                          "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0)}
+                          "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0),
+                          "first_ts": d.get("first_ts", d.get("ts", 0.0))}   # ilk görülme (5.1.1 sıra kanıtı)
                          for d in self.scan_detections.values()),
                         key=lambda x: x["freq_mhz"]),
                     "tx_active": self.tx_active,
@@ -1606,12 +1799,23 @@ class SDRWorker(QThread):
                                     if float(spectrum_info.get("snr_db", 0.0) or 0.0) >= 6.0 else None),
                     # Diğer sayısal özellikler (5.1.2): sembol/baud hızı
                     "symbol_rate_hz": float(self._clf_result.get("symbol_rate_hz", 0.0) or 0.0),
+                    # KONSOLİDE PARAMETRELER (5.1.2 stabilizasyon): çoğunluk oyu + medyan + güven etiketi
+                    # -> arayüz titrek ham değer yerine KARARLI, güven-etiketli değeri gösterir.
+                    "params_consolidated": self.param_consol.consolidated(),
+                    # CTCSS/DCS (5.2.3): analog FM hedefin alt-ses squelch'i (aldatmaya otomatik taşınır)
+                    "ctcss_hz": float(getattr(self, "_detected_ctcss_hz", 0.0) or 0.0),
+                    "squelch_type": getattr(self, "_squelch_type", None),   # "CTCSS" / "DCS" / None
                     # Sinyal izleme/takip (5.1.3): süreklilik + parametre geçmişi özeti
                     "monitor": self.monitor.status(),
                     # Sayısal ses (5.1.3): 4FSK/C4FM tespit özeti (sayısal çözme aktifken)
                     "digital_voice": (self.audio_player.get_last_fsk()
                                       if (self.audio_player is not None
                                           and self.audio_player.digital_enabled) else None),
+                    # Sayısal VERİ (5.1.3 "ses ve/veya veriye ulaşılması"): DSD-FME'den çözülen
+                    # çağrı/sync/renk-kodu/TG satırları (sayısal çözme aktif + DSD-FME çalışıyorsa)
+                    "digital_data": (self.audio_player.get_digital_data()
+                                     if (self.audio_player is not None
+                                         and self.audio_player.digital_enabled) else None),
                 }
 
                 # C++ akış-sağlığı sayaçlarını payload'a yansıt + artışları logla (bulgu #6 tamamlayıcısı)

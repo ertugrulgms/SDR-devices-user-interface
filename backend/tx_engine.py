@@ -82,9 +82,10 @@ class TxWaveformBuilder:
             buf = self.jam_gen.generate_spot_noise(n, amplitude=amp, bw_frac=spot_bw, offset_hz=off)
 
         elif mode == "MULTI_TONE":
-            # Hedef profiline göre ton sayısı/aralığı (dar-bant telsiz vs geniş-bant veri)
-            buf = self.jam_gen.generate_multi_tone(
-                n, amplitude=amp, n_tones=prof["n_tones"], spacing_hz=prof["spacing_hz"])
+            # ÇOKLU karıştırma: GÜRÜLTÜ tabanlı çok-bant tarağı (Shannon-etkin — saf CW ton DEĞİL).
+            # Hedef profilindeki bant sayısı kadar dar-bant gürültü alt-bandı, bandın %80'ine yayılır.
+            buf = self.jam_gen.generate_multi_band_noise(
+                n, amplitude=amp, n_bands=max(2, int(prof["n_tones"])), band_bw_frac=0.03)
 
         elif mode == "SWEEP":
             # Süpürmeli (chirp), faz-sürekli; frekans-çevik hedefler için. Süpürme bandı hedefe göre.
@@ -107,7 +108,10 @@ class TxWaveformBuilder:
                     # CTCSS alt-ses tonu (hedef ton-squelch'ini açar; ton yoksa hoparlör açılmaz)
                     ctcss_hz=float(params.get("decept_ctcss_hz", 0.0) or 0.0),
                     ctcss_dev_hz=float(params.get("decept_ctcss_dev_hz", 500.0)),
-                    preemphasis=bool(params.get("decept_preemphasis", True)))
+                    preemphasis=bool(params.get("decept_preemphasis", True)),
+                    # DCS: yakalanan alt-ses kodu geri-oynatılır (CTCSS yoksa; kod-squelch açar)
+                    subaudio=params.get("decept_subaudio", None),
+                    subaudio_rate=float(params.get("decept_subaudio_rate", 0.0) or 0.0))
                 meta["deception_audio_samples"] = int(len(buf))
                 meta["decept_mod"] = params.get("decept_mod", "NBFM")
                 meta["decept_ctcss_hz"] = float(params.get("decept_ctcss_hz", 0.0) or 0.0)

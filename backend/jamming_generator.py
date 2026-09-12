@@ -158,6 +158,28 @@ class JammingGenerator:
         sig /= n_tones                                   # tepe genliğini sınırla
         return (amplitude * sig).astype(np.complex64)
 
+    def generate_multi_band_noise(self, num_samples: int, amplitude: float = 1.0,
+                                  n_bands: int = 5, band_bw_frac: float = 0.03,
+                                  spread_frac: float = 0.8) -> np.ndarray:
+        """ÇOKLU (comb) karıştırma — GÜRÜLTÜ tabanlı (Shannon-etkin). Bandın spread_frac'i boyunca
+        eşit aralıklı N alt-bant; her biri DAR-BANT GÜRÜLTÜ (band_bw_frac).
+
+        Neden saf çoklu-TON değil (5.2.1): şartname karıştırmayı 'alıcı girişinde GÜRÜLTÜ seviyesinin
+        yükseltilmesi' (Shannon kanal kapasitesine taarruz) olarak tanımlar. Saf CW ton tek spektral
+        çizgidir -> gürültü tabanını yükseltmez, sayısal/yayılı-spektrum alıcı onu çentikle atar. Her
+        alt-bant GÜRÜLTÜ ise o kanalda gürültü tabanını yükseltir -> çentiklemeye/AGC'ye dayanıklı,
+        birden çok hedef kanalını (veya frekans-çevik hedefi) AYNI ANDA etkili bastırır."""
+        n_bands = max(1, int(n_bands))
+        t = np.arange(num_samples) / self.sample_rate
+        step = (self.sample_rate * spread_frac) / max(n_bands, 1)
+        offsets = (np.arange(n_bands) - (n_bands - 1) / 2.0) * step
+        sig = np.zeros(num_samples, dtype=np.complex128)
+        for off in offsets:
+            band = self.generate_barrage_noise(num_samples, amplitude=1.0, bw_frac=band_bw_frac)
+            sig += band * np.exp(1j * 2 * np.pi * off * t)
+        sig /= np.sqrt(n_bands)                          # bağımsız gürültü -> güç toplanır; RMS'i dengele
+        return (amplitude * sig).astype(np.complex64)
+
     def generate_chirp_sweep(self, num_samples: int, amplitude: float = 1.0,
                              sweep_fraction: float = 0.9, n_sweeps: int = 8) -> np.ndarray:
         """SÜPÜRMELİ (Chirp / LFM) jammer: frekans bant içinde -B/2'den +B/2'ye HIZLA tarar ve

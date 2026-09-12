@@ -86,6 +86,41 @@ def detect_ctcss(disc_audio: np.ndarray, audio_rate: float):
             "ctcss_std_hz": std if present else None, "snr_db": round(snr_db, 1)}
 
 
+def extract_subaudio(disc_audio: np.ndarray, audio_rate: float, cutoff_hz: float = 300.0) -> np.ndarray:
+    """FM ayrımlayıcı çıkışından ALT-SES (sub-audible, <cutoff) squelch bileşenini süzer — CTCSS tonu
+    ya da DCS sayısal akışı. Aldatmada bu bileşeni sese ekleyip hedefin ton/kod-squelch'ini açmak için
+    kullanılır (özellikle DCS'te: tam bit-formatını yeniden ÜRETMEK yerine hedefin GERÇEK kodunu
+    yakalayıp GERİ-OYNATMAK -> format hatası riski olmaz)."""
+    x = np.asarray(disc_audio, dtype=np.float64)
+    if x.size < 8:
+        return np.zeros(0, dtype=np.float64)
+    x = x - np.mean(x)
+    n = len(x)
+    X = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(n, d=1.0 / audio_rate)
+    X[freqs > cutoff_hz] = 0.0            # keskin low-pass -> yalnızca alt-ses squelch
+    return np.fft.irfft(X, n).astype(np.float64)
+
+
+def detect_dcs(disc_audio: np.ndarray, audio_rate: float) -> dict:
+    """DCS (Dijital Kodlu Squelch / DPL) tespiti: alt-ses (<300 Hz) bileşen TEK TON (CTCSS) değil,
+    ~134 bps DİJİTAL bir akışsa (enerji tek tepeye yığılmaz, banda yayılır) DCS olası. Dönüş:
+    {'present', 'peak_ratio'}. Sahte tespit yok: enerji yoksa/tek-tonsa present=False."""
+    sub = extract_subaudio(disc_audio, audio_rate)
+    if sub.size < 64 or np.std(sub) < 1e-6:
+        return {"present": False, "peak_ratio": 1.0}
+    S = np.abs(np.fft.rfft(sub * np.hanning(len(sub)))) ** 2
+    freqs = np.fft.rfftfreq(len(sub), d=1.0 / audio_rate)
+    band = (freqs >= 50.0) & (freqs <= 300.0)
+    Sb = S[band]
+    tot = float(np.sum(Sb))
+    if tot < 1e-9:
+        return {"present": False, "peak_ratio": 1.0}
+    peak_ratio = float(np.max(Sb) / tot)   # CTCSS tek ton -> yüksek (~>0.4); DCS yayılı -> düşük
+    present = peak_ratio < 0.25
+    return {"present": bool(present), "peak_ratio": round(peak_ratio, 3)}
+
+
 def channel_deviation_budget(channel_khz: float = 12.5):
     """Kanal genişliğine göre güvenli (ses, CTCSS) tepe sapma bütçesi (Hz). Toplam, kanal maks.
     sapmasını aşmaz (splatter/komşu-kanal taşması önlenir). 12.5 kHz -> (2000, 500); 25 -> (4000, 750)."""
@@ -128,7 +163,9 @@ class AnalogDeceptionModulator:
     def modulate(self, audio: np.ndarray, rate_in: int, mode: str = "NBFM",
                  deviation_hz: float = DEFAULT_NBFM_DEVIATION_HZ, amplitude: float = 0.9,
                  max_samples: int = MAX_DECEPTION_SAMPLES, ctcss_hz: float = 0.0,
-                 ctcss_dev_hz: float = 500.0, preemphasis: bool = True) -> np.ndarray:
+                 ctcss_dev_hz: float = 500.0, preemphasis: bool = True,
+                 subaudio: np.ndarray = None, subaudio_rate: float = 0.0,
+                 subaudio_dev_hz: float = 600.0) -> np.ndarray:
         """Ses mesajını baseband complex64 aldatma sinyaline çevirir (hedef modülasyonuna uygun).
 
         NBFM: sabit zarf, faz = 2π·∫f_dev  (dar-bant FM ses telsizi). f_dev = sapma·ses(+CTCSS tonu).
@@ -161,11 +198,19 @@ class AnalogDeceptionModulator:
             env = 0.575 + 0.425 * x
             buf = env.astype(np.complex64)
         else:  # NBFM (ses amatör telsizi varsayılanı)
-            # Anlık FREKANS SAPMASI (Hz): ses + (varsa) CTCSS alt-ses tonu
+            # Anlık FREKANS SAPMASI (Hz): ses + (varsa) alt-ses squelch (CTCSS tonu VEYA DCS replay)
             f_dev = float(deviation_hz) * x
             if ctcss_hz and ctcss_hz > 0.0:
+                # CTCSS: tek ton -> temiz üret
                 t = np.arange(len(x)) / self.sample_rate
                 f_dev = f_dev + float(ctcss_dev_hz) * np.sin(2.0 * np.pi * float(ctcss_hz) * t)
+            elif subaudio is not None and len(np.asarray(subaudio)) > 8 and subaudio_rate > 0:
+                # DCS (veya bilinmeyen alt-ses kod): hedefin GERÇEK alt-ses kodunu GERİ-OYNAT (capture-
+                # replay) -> DCS bit-formatını yeniden üretme riski yok, hedefin kod-squelch'i açılır.
+                sa = self._resample(np.asarray(subaudio, dtype=np.float64), int(subaudio_rate))
+                pk = float(np.max(np.abs(sa))) + 1e-12
+                sa = np.resize(sa / pk, len(x))          # ses uzunluğuna DÖNGÜSEL doldur (kod tekrarlar)
+                f_dev = f_dev + float(subaudio_dev_hz) * sa
             phase = 2.0 * np.pi * np.cumsum(f_dev) / self.sample_rate
             buf = np.exp(1j * phase).astype(np.complex64)
 
