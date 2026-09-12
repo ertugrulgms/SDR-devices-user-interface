@@ -78,6 +78,8 @@ def triangulate_lob(positions, directions):
     kaynağın YER İZDÜŞÜMÜ bulunur; irtifa için elevation ölçümü gerekir). En az 2 LOB gerekir.
     GDOP kapısı: LOB'lar neredeyse paralelse (en geniş kesişim < MIN_CROSSING_ANGLE_DEG) konum
     güvenilmezdir -> fix=False (sahte-güvenli konum üretilmez).
+    İLERİ-YÖN kapısı: çözüm herhangi bir düğümün kerteriz ışınının ARKASINDAysa (hayalet hedef)
+    -> fix=False. Işınlar yön taşır; matematiksel doğrular taşımaz.
     """
     positions = [np.asarray(p, float) for p in positions]
     directions = [np.asarray(d, float) / (np.linalg.norm(d) + 1e-12) for d in directions]
@@ -113,8 +115,16 @@ def triangulate_lob(positions, directions):
     # Ortalama dik kalıntı (kesişim kalitesi göstergesi, metre)
     res = float(np.mean([np.linalg.norm((np.eye(3) - np.outer(d, d)) @ (x - p))
                          for p, d in zip(positions, directions)]))
+    # İLERİ-YÖN (RAY) KAPISI — HAYALET HEDEF önleme (KRİTİK): lstsq sonsuz DOĞRULARI kesiştirir,
+    # ışınların YÖNÜNÜ (ileri/geri) yok sayar. LOB'lar ölçüm gürültüsüyle (ör. birkaç derece Kuzey
+    # sapması / yansıma) ıraksarsa, en-küçük-kareler çözümü ışınları GERİYE uzatıp kesişimi antenlerin
+    # ARKASINDA bulabilir -> harita hedefi gerçek yönün TAM TERSİNE fırlatır ("hayalet hedef").
+    # Gerçek kaynak, HER düğümün kerteriz ışınının ÖNÜNDE olmalıdır: (x - p_i)·d_i > 0.
+    # Herhangi bir düğüm hedefi arkasında "görüyorsa" geometri fiziksel olarak tutarsızdır -> fix YOK
+    # (sahte-güvenli konum üretilmez; sistemin genel dürüstlük ilkesiyle uyumlu).
+    forward_ok = all(float(np.dot(x - p, d)) > 0.0 for p, d in zip(positions, directions))
     # GDOP kapısı: geometri çok zayıfsa (ışınlar ~paralel) konum güvenilmez -> fix yok.
-    fix = cross_deg >= MIN_CROSSING_ANGLE_DEG
+    fix = (cross_deg >= MIN_CROSSING_ANGLE_DEG) and forward_ok
     return x, round(res, 2), fix, round(cross_deg, 1)
 
 
@@ -129,10 +139,12 @@ class AmplitudeDFEstimator:
     Kullanım (yerel düğüm): her karede update(enkoder_azimutu, ölçülen_genlik_dBm). bearing()
     o ana kadarki taramadan en olası kerterizi verir."""
 
-    def __init__(self, bin_deg: float = 1.0, window_deg: float = 25.0, decay_sec: float = 8.0):
+    def __init__(self, bin_deg: float = 1.0, window_deg: float = 25.0, decay_sec: float = 15.0):
         self.bin_deg = bin_deg
         self.window_deg = window_deg          # tepe etrafı centroid penceresi
-        self.decay_sec = decay_sec            # bu süreden eski örnekler unutulur
+        self.decay_sec = decay_sec            # bu süreden eski açı örnekleri unutulur. ELLE dönüşte
+                                              # (~10 sn/tur) 8 sn kısaydı: tur bitmeden ilk taranan
+                                              # bin'ler silinip 360° resmi eksik kalabiliyordu -> 15 sn.
         self._bins = {}                       # az_bin(int) -> (amp_dbm, ts)
 
     def reset(self):
@@ -270,6 +282,36 @@ def self_node_id(registry) -> str:
         if cfg.get("self"):
             return nid
     return next(iter(registry), "NODE-MAIN")
+
+
+def polar_to_enu(dist_m: float, bearing_deg: float) -> list:
+    """Ana cihaza göre MESAFE (m) + PUSULA AÇISI (Kuzey'den saat yönü, derece) -> ENU [Doğu, Kuzey, 0].
+    Sahada yardımcı düğümü elle konumlandırmanın en kolay yolu: metreyle uzaklık + pusulayla açı.
+    azel_to_unit ile aynı çerçeve (x=r·sin(az), y=r·cos(az)); yükseklik yerde 0 alınır."""
+    r = float(dist_m)
+    az = np.radians(float(bearing_deg))
+    return [r * float(np.sin(az)), r * float(np.cos(az)), 0.0]
+
+
+def enu_to_polar(pos) -> tuple:
+    """ENU [Doğu, Kuzey, Yukarı] -> (mesafe_m, pusula_açısı_derece). polar_to_enu'nun tersi;
+    kayıtlı konumları arayüzde mesafe+açı olarak göstermek için."""
+    p = np.asarray(pos, float)
+    dist = float(np.hypot(p[0], p[1]))
+    bearing = float(np.degrees(np.arctan2(p[0], p[1]))) % 360.0     # atan2(Doğu, Kuzey)
+    return round(dist, 1), round(bearing, 1)
+
+
+def save_node_registry(registry) -> bool:
+    """Düğüm kayıt defterini data/df_nodes.json'a yazar (sahada girilen konumlar kalıcı olsun).
+    Başarısızsa sessizce False döner (dosya sistemi yoksa uygulama yine çalışır)."""
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(_NODES_PATH, "w", encoding="utf-8") as f:
+            json.dump(registry, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
 
 
 class NodeBearingStore:

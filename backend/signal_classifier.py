@@ -12,8 +12,11 @@ Tasarım ilkeleri:
     özellikleri — literatürde kanıtlı yöntemler.
   * Bağımsız ve test edilebilir: donanım gerektirmez; saf NumPy/SciPy.
 
-Faz 1 KAPSAMI: yalnızca MODÜLASYON türü (AM / FM / ASK / FSK / BPSK / QPSK / 8PSK /
-QAM). Protokol, çoklama (OFDM) ve EKKT (FHSS/DSSS) sonraki fazlarda eklenecektir.
+KAPSAM (5.1.2 tam): MODÜLASYON (AM / FM-FSK / BPSK / QPSK / 8PSK / QAM / OFDM) +
+ÇOKLAMA (OFDM / FDMA / DSSS-CDMA / TDMA / Tek Taşıyıcı) + EKKT (FHSS / DSSS) + sembol hızı +
+protokol (bant planı heuristiği). Analog FM ↔ sayısal FSK ayrımı worker'da SESLE kesinleştirilir.
+Modülasyon karar ağacı sentetik üreteçlerle (tests/synth_signals.py) AMPİRİK kalibre edildi:
+13-25 dB'de %100 ayrım. Eşikler gerçek sinyal jeneratörüyle doğrulanmalı (teşhis alanları payload'da).
 
 Not: Karar eşikleri (THRESHOLDS) sentetik sinyal kalibrasyonuyla belirlenir; bkz.
 tools/calibrate_classifier.py ve tests/test_classifier.py.
@@ -32,9 +35,6 @@ class SignalClassifier:
 
     # Çoklama (OFDM/FDMA...) tespiti için asgari SAĞLAM SNR. Altında CP otokorelasyonu/ada yapısı
     # gürültüde eriyeceği için çoklama "Belirlenemedi" döner (yanlış "Tek Taşıyıcı" iddiası yerine).
-    TH_MUX_SNR = 8.0
-
-    # ÇOKLAMA (OFDM) TESPİTİ
     TH_MUX_SNR = 8.0
 
     def __init__(self, sample_rate_hz: float):
@@ -128,17 +128,26 @@ class SignalClassifier:
         return work, iso_fs
 
     def _looks_multisignal(self, iq: np.ndarray) -> bool:
-        """Bantta birden çok AYRIK sinyal var mı? (Faz 1 tek sinyal ister.)
-        Spektrum kaba bloklara bölünür; gürültü tabanının üstündeki AYRIK aktif blok
-        kümeleri sayılır. Tek sinyal (geniş de olsa) bitişik bloklar -> 1 küme; ayrık
-        istasyonlar (ör. FM bandı) boşluklarla ayrılmış -> 3+ küme."""
+        """Bantta birden çok AYRIK sinyal var mı? (Tek-sinyal AMC karışımda yanlış sonuç verir.)
+        Spektrum SABİT 512 bine ORTALANIR (Welch-tarzı) — böylece N'den BAĞIMSIZ ve gürültü-düz olur;
+        sonra kaba bloklara bölünüp gürültü tabanının üstündeki AYRIK aktif blok kümeleri sayılır.
+        Tek sinyal (geniş de olsa) bitişik -> 1 küme; ayrık istasyonlar (ör. FM bandı) -> 3+ küme.
+
+        KRİTİK DÜZELTME (N-duyarlılığı): ham FFT'de blok-max, büyük N'de (canlı snapshot 32768) tek-bin
+        gürültü uç değerleriyle şişip TEK sinyali (dar-bant AM) 'çok sinyal' sanıyordu. 512 bine ortalama
+        gürültü varyansını düşürüp bu sahte tepeleri yok eder; gerçek çok-sinyal (3 FM istasyonu) hâlâ
+        3 küme verir. Her örnekleme hızında/N'de tutarlı."""
         x = iq - np.mean(iq)
         spec = np.abs(np.fft.fftshift(np.fft.fft(x * np.hamming(len(x))))) ** 2
+        NB = 512
+        if len(spec) >= NB:
+            m = (len(spec) // NB) * NB
+            spec = spec[:m].reshape(NB, -1).mean(axis=1)        # N-bağımsız, gürültü-düz güç spektrumu
         p_db = 10 * np.log10(spec + 1e-12)
         noise = np.median(p_db)
 
         nblocks = 24
-        L = len(p_db) // nblocks
+        L = max(1, len(p_db) // nblocks)
         active = np.array([p_db[i * L:(i + 1) * L].max() > noise + 12.0 for i in range(nblocks)])
         # Ayrık aktif blok kümesi sayısı (0->1 geçişleri)
         clusters = int(active[0]) + int(np.sum((~active[:-1]) & active[1:]))
@@ -232,6 +241,11 @@ class SignalClassifier:
     # Eski 6.0 eşiği 2FSK'yı (düşük SNR'de) YANLIŞ OFDM sanıyordu. 12.0: OFDM (42) geçer, 2FSK (8)
     # elenir — arada geniş güvenlik payı (düşük-CP OFDM ~20 de geçer).
     TH_OFDM_PROMINENCE = 12.0
+    # OFDM Gauss-zarflıdır (yüksek PAPR -> zarf değişim katsayısı ~0.5). Sabit-zarflı FSK/FM'in
+    # SEMBOL periyodik otokorelasyonu düşük SNR'de CP'yi TAKLİT edip yanlış OFDM verebiliyordu
+    # (2FSK@13dB prom~11, ara sıra >12). Zarf değişim katsayısı bunun ALTINDA ise OFDM REDDEDİLİR:
+    # OFDM~0.52, FSK/FM/PSK<0.17 -> 0.30 geniş güven payı.
+    TH_OFDM_ENV_CV = 0.30
 
     # OFDM işgal-bandı ALT sınırı. Uzman eleştirisi (haklı): 56 MHz'de yakalanan 20 MHz Wi-Fi
     # bandın yalnızca ~%36'sını kaplar; eski 0.55 eşiği bunu CP testine SOKMADAN "Tek Taşıyıcı"
@@ -280,7 +294,12 @@ class SignalClassifier:
         peak_i = int(np.argmax(R))
         prom = float(R[peak_i] / (np.median(R) + 1e-12))
         if prom > self.TH_OFDM_PROMINENCE:
-            return "OFDM (Çok Taşıyıcı)", prom, int(ds[peak_i])
+            # ZARF DOĞRULAMASI: OFDM Gauss-zarflıdır; sabit-zarflı FSK/FM'i yanlış OFDM sanmayı önle.
+            a = np.abs(x)
+            env_cv = float(np.std(a) / (np.mean(a) + 1e-12))
+            if env_cv > self.TH_OFDM_ENV_CV:
+                return "OFDM (Çok Taşıyıcı)", prom, int(ds[peak_i])
+            return "Tek Taşıyıcı", prom, 0        # yüksek CP tepesi ama sabit zarf -> FSK/FM, OFDM değil
         return "Tek Taşıyıcı", prom, 0
 
     # ------------------------------------------------------------------ #
@@ -420,12 +439,24 @@ class SignalClassifier:
     # AYIRT ETMİYOR — hatta TERS: geniş-bant ses-AM'de env_par ~150-250, ama FM->AM dönüşümlü FM'de
     # ~350-600 (periyodik dalga keskin tepe yapar). Bu yüzden 'par>=30' koşulu gerçek AM'i FM'e
     # düşürüyordu (kullanıcı: "sabit FM'e kalıyor"). Tek güvenilir ayraç sigma_aa'nın BÜYÜKLÜĞÜdür.
-    TH_AM_SAA = 0.09          # sigma_aa bunun ÜSTünde -> AM, altında -> FM. Sinyal jeneratöründe
-                              # önerilen derinlik %50-80 -> sigma_aa 0.22+ (çok geniş güven payı).
-    # TH_AM_PAR = 30.0        # (env_par KALDIRILDI — gerçekçi sinyalde ters çalışıyordu, yukarı bkz.)
-    # TH_AM_GAMMA = 50.0      # (eski, N-bağımlı — kaldırıldı; dessimasyonda AM'i kaçırıyordu)
-    # TH_KURT_FM = 6.0        # if_kurt bunun ALTINDA -> Frekans mod. (dijital açılınca)
-    # TH_QAM_SIGMA_AA = 0.27  # QAM ayrımı (dijital açılınca)
+    # ---- KARAR AĞACI EŞİKLERİ (AM/FM/FSK/PSK/QAM) — sentetik üreteçlerle (tests/synth_signals.py)
+    # AMPİRİK olarak ölçüldü; 13-25 dB'de %100 ayrım (bkz. tools/calibrate_classifier.py).
+    # Ölçülen özellik değerleri (N=32768, fs=2.4M, 13-25 dB ortalaması):
+    #   AM     sigma_dp~0.3-0.5  sigma_aa~0.49           | FM/2FSK  if_kurt~1.5  sigma_dp~1.8
+    #   16QAM  sigma_aa~0.35     if_kurt~11-13           | BPSK  c40~1.9  QPSK c40~0.97  8PSK c40~0.01
+    # AYRIT EDİCİ MANTIK (sıra önemli):
+    #   1) AM:   sigma_dp DÜŞÜK (faz-uyumlu) + zarf DEĞİŞKEN — AM tek faz-uyumlu tür (diğerleri ~1.8+)
+    #   2) FM/FSK: if_kurt DÜŞÜK (açı mod, sabit zarf) — analog/sayısal ayrımı SESLE (worker) yapılır
+    #   3) QAM:  zarf DEĞİŞKEN (dijital genlik)
+    #   4) PSK:  sabit zarf; mertebe (BPSK/QPSK/8PSK) C40 kümülantıyla
+    # NOT: Eşikler sentetikten türedi; GERÇEK sinyal jeneratörünle doğrula (payload'daki teşhis
+    # alanları sigma_dp/if_kurt/c40 terminalde izlenebilir).
+    TH_AM_SDP = 1.0           # sigma_dp bunun ALTINDA (+ değişken zarf) -> AM (faz-uyumlu analog genlik)
+    TH_AM_SAA = 0.10          # AM için gereken asgari zarf değişimi (sabit-zarfı AM sanmayı önler)
+    TH_KURT_FM = 5.0          # if_kurt bunun ALTINDA -> FM/FSK (açı mod.); FM/2FSK~1.5, sonraki tür ~11
+    TH_QAM_SAA = 0.25         # zarf değişimi bunun ÜSTünde (dijital) -> QAM; 16QAM~0.35, PSK~0.12
+    TH_C40_BPSK = 1.4         # |C40| bunun ÜSTünde -> BPSK (~1.9)
+    TH_C40_QPSK = 0.5         # |C40| bunun ÜSTünde -> QPSK (~0.97); altı -> 8PSK (~0.01)
 
     @staticmethod
     def _margin_conf(value, threshold, scale):
@@ -434,33 +465,39 @@ class SignalClassifier:
         return float(min(1.0, 0.5 + 0.5 * min(m, 1.0)))
 
     def _decide(self, f: dict):
-        """SADECE ANALOG karar: AM (Analog-Genlik) vs FM (Analog-Frekans). İkili çıktı — sinyal
-        jeneratöründen AM basınca AM, FM basınca FM.
+        """MODÜLASYON KARARI (hiyerarşik ağaç) — AM / FM-FSK / QAM / BPSK / QPSK / 8PSK.
+        Ampirik ölçümle (tests/synth_signals) 13-25 dB'de %100 ayrım. Sıra kritiktir:
 
-        TEK KOŞUL — sigma_aa (genlik değişiminin büyüklüğü):
-          * sigma_aa >= TH_AM_SAA -> AM (zarf mesajla belirgin değişiyor)
-          * sigma_aa <  TH_AM_SAA -> FM (zarf ~sabit; gerçekçi dalgalanma bile eşiğin altında)
+          1) AM (Analog-Genlik): sigma_dp DÜŞÜK (<TH_AM_SDP) + zarf DEĞİŞKEN (saa>=TH_AM_SAA).
+             AM tek FAZ-UYUMLU türdür (sigma_dp~0.3-0.5); diğer HER şey ~1.8-2.2 -> SNR'den bağımsız,
+             en sağlam ayraç. Düşük SNR'de if_kurt düştüğü için AM önce sigma_dp ile yakalanır.
+          2) FM/FSK (Frekans Mod.): if_kurt DÜŞÜK (<TH_KURT_FM, açı mod. + sabit zarf). Analog FM mi
+             sayısal FSK mi ayrımı ÖZELLİKTEN güvenilir değil (13 dB'de örtüşür) -> SES demodülasyonu
+             ile (worker._refine_analog_digital: FM ayrımlayıcı + 4FSK/C4FM tespiti) kesinleştirilir.
+          3) QAM (Sayısal-Genlik): değişken zarf dijital (saa>=TH_QAM_SAA; 16QAM~0.35, PSK~0.12).
+          4) PSK (Sayısal-Faz): sabit zarf; mertebe |C40| ile (BPSK~1.9, QPSK~0.97, 8PSK~0.01).
 
-        Neden env_par DEĞİL: gerçekçi sinyalde AM/FM'i ayırt etmiyor (hatta ters — FM->AM dönüşümlü
-        FM'de env_par AM'den yüksek). Neden gamma_max DEĞİL: örnek sayısıyla ölçekleniyordu ->
-        dessimasyonda AM'i kaçırıyordu. sigma_aa N-BAĞIMSIZ ve güvenilmez iç SNR tahminine bağlı değil.
+        Eşikler sentetik üreteçlerden türedi; gerçek jeneratörle doğrula (teşhis alanları payload'da)."""
+        kurt = f["if_kurt"]; saa = f["sigma_aa"]; sdp = f["sigma_dp"]; c40 = f["c40"]
 
-        DİJİTAL MODÜLASYON TESPİTİ ŞİMDİLİK KAPALI — test cihazımız yok. İleride açmak için
-        aşağıdaki dijital dalları (QAM/PSK/FSK) yorumdan çıkarın (if_kurt/sigma_aa kullanır)."""
-        saa = f["sigma_aa"]
+        # 1) AM — faz-uyumlu (sabit faz) + değişken zarf
+        if sdp < self.TH_AM_SDP and saa >= self.TH_AM_SAA:
+            return "AM (Analog-Genlik)", self._margin_conf(self.TH_AM_SDP, sdp, 0.5)
 
-        if saa >= self.TH_AM_SAA:                     # belirgin genlik (zarf) değişimi -> AM
-            return "AM (Analog-Genlik)", self._margin_conf(saa, self.TH_AM_SAA, 0.15)
-        # Sabit/az-değişken zarf -> FM. Güven: sigma_aa eşiğin ne kadar altındaysa o kadar yüksek.
-        return "FM (Analog-Frekans)", self._margin_conf(self.TH_AM_SAA, saa, 0.06)
+        # 2) FM/FSK — açı modülasyonu (sabit zarf, düşük impulsiflik). Analog/sayısal SESLE ayrılır.
+        if kurt < self.TH_KURT_FM:
+            return "FM/FSK (Frekans Mod.)", self._margin_conf(self.TH_KURT_FM, kurt, 3.0)
 
-        # --- DİJİTAL TÜRLER (ŞİMDİLİK KAPALI — ileride açılacak) -----------------------------
-        # kurt = f["if_kurt"]
-        # if kurt < self.TH_KURT_FM:                 # sabit faz -> açı mod. (FM/FSK/PM ortak)
-        #     return "FM/FSK/PM (Açı Mod.)", self._margin_conf(self.TH_KURT_FM, kurt, 4.0)
-        # if saa > self.TH_QAM_SIGMA_AA:             # yüksek impulsiflik + değişken zarf -> QAM
-        #     return "QAM (Sayısal-Genlik)", self._margin_conf(saa, self.TH_QAM_SIGMA_AA, 0.15)
-        # return "PSK (Sayısal-Faz)", self._margin_conf(kurt, self.TH_KURT_FM, 20.0)  # sabit zarf -> PSK
+        # 3) QAM — değişken zarf dijital genlik
+        if saa >= self.TH_QAM_SAA:
+            return "QAM (Sayısal-Genlik)", self._margin_conf(saa, self.TH_QAM_SAA, 0.15)
+
+        # 4) PSK — sabit zarf dijital faz; mertebe C40 kümülantıyla
+        if c40 >= self.TH_C40_BPSK:
+            return "BPSK (Sayısal-Faz)", self._margin_conf(c40, self.TH_C40_BPSK, 0.6)
+        if c40 >= self.TH_C40_QPSK:
+            return "QPSK (Sayısal-Faz)", self._margin_conf(c40, self.TH_C40_QPSK, 0.5)
+        return "8PSK (Sayısal-Faz)", self._margin_conf(self.TH_C40_QPSK, c40, 0.5)
 
     def estimate_symbol_rate_hz(self, iq: np.ndarray) -> float:
         """Sembol (baud) hızını kestirir. Kiplenmiş dijital sinyalin GÜCÜ (|x|²) sembol saatinde
@@ -557,46 +594,52 @@ class SignalClassifier:
                 return {"modulation": "FHSS (Atlamalı)", "confidence": 0.8, "snr_db": round(snr, 1),
                         "multiplex": "Tek Taşıyıcı (hop başına)", "ekkt": ekkt}
 
-        # --- ÇOKLAMA / OFDM / DSSS (DİJİTAL) TESPİTİ ŞİMDİLİK KAPALI (yorumda) ---------------
-        # Şu an yalnızca AM/FM (analog) ayrımı yapıyoruz (test cihazı yok). İleride dijital türleri
-        # açmak için aşağıdaki bloğu yorumdan çıkarın:
-        # x0 = iq - np.mean(iq)
-        # Sdb0 = 10 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(x0 * np.hamming(len(x0))))) ** 2 + 1e-12)
-        # snr_robust = float(np.max(Sdb0) - np.percentile(Sdb0, 15))
-        # mux, dsss, mux_conf = self.analyze_multiplex_ekkt(iq)
-        # if not mux.startswith("OFDM") and snr_robust < self.TH_MUX_SNR:
-        #     mux, dsss, mux_conf = "Belirlenemedi (düşük SNR)", False, 0.0
-        # ekkt_dsss = "DSSS (Yayılı Spektrum)" if dsss else "Yok"
-        # if mux.startswith("OFDM"):
-        #     return {"modulation": "OFDM (Çok Taşıyıcı)", "confidence": round(mux_conf, 2),
-        #             "snr_db": round(snr, 1), "multiplex": mux, "ekkt": "Yok"}
+        # --- ÇOKLAMA / OFDM / DSSS TESPİTİ (5.1.2) — GENİŞ BANT üzerinde ---------------------
+        # OFDM (CP otokorelasyonu), FDMA (ayrık taşıyıcı), DSSS/CDMA (geniş+düz), TDMA-benzeri.
+        # SNR EŞİĞİNDEN ÖNCE çalışır: OFDM/DSSS DÜZ spektrumludur -> tepe-medyan SNR ölçüsü (_estimate_snr_db)
+        # bunları YANLIŞ 'düşük SNR' sanıp elerdi. OFDM tespiti CP otokorelasyonuna dayanır (SNR ölçüsünden
+        # bağımsız). Sağlam-SNR düşükse tek-taşıyıcı çoklama etiketi "Belirlenemedi" olur (dürüst).
+        x0 = iq - np.mean(iq)
+        Sdb0 = 10 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(x0 * np.hamming(len(x0))))) ** 2 + 1e-12)
+        snr_robust = float(np.max(Sdb0) - np.percentile(Sdb0, 15))
+        mux, dsss, mux_conf = self.analyze_multiplex_ekkt(iq)
+        if not mux.startswith("OFDM") and snr_robust < self.TH_MUX_SNR:
+            mux, dsss, mux_conf = "Belirlenemedi (düşük SNR)", False, 0.0
+        ekkt_dsss = "DSSS (Yayılı Spektrum)" if dsss else "Yok"
 
+        # OFDM ise modülasyon zaten çok-taşıyıcı: tek-taşıyıcı AMC uygulanmaz (dürüst). SNR eşiğinden
+        # ÖNCE döner (düz-spektrum OFDM tepe-medyan eşiğine takılmasın).
+        if mux.startswith("OFDM"):
+            return {"modulation": "OFDM (Çok Taşıyıcı)", "confidence": round(mux_conf, 2),
+                    "snr_db": round(snr, 1), "multiplex": mux, "ekkt": "Yok",
+                    "occupied_bw_hz": round(self.estimate_bandwidth_hz(iq), 0)}
+
+        # Tek-taşıyıcı AMC için tepe-medyan SNR eşiği (dar-bant modülasyonların ince yapısı gürültüde erir).
         if snr < self.SNR_THRESHOLD_DB:
             return {"modulation": "Belirlenemedi (düşük SNR)", "confidence": 0.0,
-                    "snr_db": round(snr, 1)}
+                    "snr_db": round(snr, 1), "multiplex": mux, "ekkt": ekkt_dsss}
 
-        # Faz 1 tek sinyal ister; geniş bantta çok sinyal karışımı yanlış sonuç verir.
+        # Çok sinyal karışımı: modülasyon güvenilir çıkarılamaz ama ÇOKLAMA parametresi yine bildirilir.
         if self._looks_multisignal(iq):
             return {"modulation": "Belirlenemedi (çok sinyal — bandı daraltın/tune edin)",
-                    "confidence": 0.0, "snr_db": round(snr, 1)}
+                    "confidence": 0.0, "snr_db": round(snr, 1), "multiplex": mux, "ekkt": ekkt_dsss}
 
-        # GERÇEK KANAL İZOLASYONU (DDC): Dinamik çalışma hızı ile merkezleme
+        # GERÇEK KANAL İZOLASYONU (DDC): en güçlü sinyali izole edip modülasyonu sınıflandır.
         work, iso_fs = self._channelize(iq)
         if len(work) < 256:
             return {"modulation": "Belirlenemedi (yetersiz örnek)", "confidence": 0.0,
-                    "snr_db": round(snr, 1)}
+                    "snr_db": round(snr, 1), "multiplex": mux, "ekkt": ekkt_dsss}
 
         feats = self.extract_features(work, iso_fs)
-        # _decide KESİN ikili karar verir: AM ya da FM (sinyalsiz/düşük-SNR/çok-sinyal durumları
-        # yukarıda zaten elendi). Kullanıcı isteği: sinyal varken net AM/FM yazsın.
         mod, conf = self._decide(feats)
-        # SADECE ANALOG (AM/FM): dijital alanlar (multiplex/ekkt/symbol_rate) şimdilik KAPALI.
-        # sigma_aa TEŞHİS için döndürülür: gerçek donanımda sinyal jeneratöründen AM/FM basıp bu
-        # değeri terminalde izleyerek eşiğin (TH_AM_SAA=0.09) sinyalinizle uyumunu doğrulayabilirsiniz.
+        # Sembol/baud hızı yalnızca DİJİTAL türlerde anlamlıdır (analog FM/AM'de sahte çizgi üretmesin).
+        is_digital = any(t in mod for t in ("PSK", "QAM"))
+        symrate = round(self.estimate_symbol_rate_hz(iq), 0) if is_digital else 0.0
+        # TEŞHİS alanları (sigma_dp/if_kurt/c40): gerçek jeneratörle eşik doğrulaması için terminalde izle.
         return {"modulation": mod, "confidence": round(conf, 2), "snr_db": round(snr, 1),
-                "sigma_aa": round(feats["sigma_aa"], 3)}
-        # İleride dijital açılınca:  "multiplex": mux, "ekkt": ekkt_dsss,
-        #   "symbol_rate_hz": round(self.estimate_symbol_rate_hz(iq) if ("PSK" in mod or "QAM" in mod) else 0.0, 0)
+                "multiplex": mux, "ekkt": ekkt_dsss, "symbol_rate_hz": symrate,
+                "sigma_aa": round(feats["sigma_aa"], 3), "sigma_dp": round(feats["sigma_dp"], 3),
+                "if_kurt": round(feats["if_kurt"], 2), "c40": round(feats["c40"], 3)}
 
 
 class HoppingHistoryTracker:

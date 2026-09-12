@@ -105,7 +105,7 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w._scan_settle_until = 0.0                      # oturmayı atla
         # Gerçekçi bir sinyal adası (çok bin geniş) simüle et
         fft = np.full(2048, -80.0); fft[1000:1030] = -30.0   # ~30 bin genişliğinde ada
-        self.w._last_fft_dbm = fft
+        self.w._last_raw_fft = fft
         start_freq = self.w.center_freq_mhz
         self.w._service_scan()
         self.assertGreater(len(self.w.scan_detections), 0)   # tespit kaydedildi
@@ -120,11 +120,11 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.set_bandwidth(20.0)
         self.w.start_scan_rf(400.0, 400.0)                   # tek frekans (revisit aynı merkez)
         self.w._scan_settle_until = 0.0
-        self.w._last_fft_dbm = np.full(2048, -80.0)          # 1) boş band
+        self.w._last_raw_fft = np.full(2048, -80.0)          # 1) boş band
         self.w._service_scan()
         self.w.scan_cursor_mhz = 400.0                       # aynı merkeze dön
         self.w._scan_settle_until = 0.0
-        self.w._last_fft_dbm = np.full(2048, -35.0)          # 2) dev geniş-bant sinyal (band %100 dolu)
+        self.w._last_raw_fft = np.full(2048, -35.0)          # 2) dev geniş-bant sinyal (band %100 dolu)
         self.w._service_scan()
         self.assertGreater(len(self.w.scan_detections), 0)   # medyan körlenirdi; tarihsel-min yakaladı
 
@@ -132,7 +132,7 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.set_bandwidth(20.0)
         self.w.start_scan_rf(400.0, 2500.0)
         self.w._scan_settle_until = 0.0
-        self.w._last_fft_dbm = np.full(2048, -78.0)          # düz gürültü
+        self.w._last_raw_fft = np.full(2048, -78.0)          # düz gürültü
         self.w._service_scan()
         self.assertEqual(len(self.w.scan_detections), 0)     # sahte tespit YOK
 

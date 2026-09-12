@@ -142,9 +142,11 @@ class SDRMainWindow(QMainWindow):
         # DF Panel Sinyalleri
         self.df_panel.mode_changed.connect(self.toggle_df_mode)
         self.df_panel.manual_angle_changed.connect(self.manual_angle_changed)
-        self.df_panel.start_scan_clicked.connect(self.toggle_antenna_scan)
+        self.df_panel.node_positions_changed.connect(self.apply_node_positions)
         self.df_panel.calibration_toggled.connect(self.handle_df_calibration_toggle)
         self.df_panel.debug_iq_clicked.connect(self.handle_debug_iq_clicked)
+        # Kayıtlı yardımcı düğüm konumlarını (df_nodes.json) panele önceden yükle
+        self.df_panel.set_node_positions(self.worker.get_aux_node_positions())
 
         # Ses (spec 5.1.3): demod modu + Dinle/Sustur + Sayısal Çöz
         self.analysis_panel.audio_mode_changed.connect(self.worker.set_audio_mode)
@@ -243,15 +245,12 @@ class SDRMainWindow(QMainWindow):
         if hasattr(self, 'worker'):
             self.worker.dump_raw_iq()
 
-    def toggle_antenna_scan(self):
-        if self.df_panel.btn_start_scan.text() == "Otonom Anten Taraması Başlat":
-            self.worker.hw_ctrl.start_scan()
-            self.df_panel.btn_start_scan.setText("Taramayı Durdur")
-            self.df_panel.btn_start_scan.setStyleSheet("font-size: 14px; background-color: #d32f2f; color: white; font-weight: bold; border-radius: 4px; padding: 4px;")
-        else:
-            self.worker.hw_ctrl.stop_scan()
-            self.df_panel.btn_start_scan.setText("Otonom Anten Taraması Başlat")
-            self.df_panel.btn_start_scan.setStyleSheet("font-size: 14px; background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px;")
+    def apply_node_positions(self, polar_list):
+        """DF panelinden gelen yardımcı düğüm konumlarını (mesafe m + pusula açısı°) worker'a uygula.
+        Ana cihaz (0,0) sabittir; konum belirleme (5.1.5) bu konumlara göre üçgenler."""
+        if hasattr(self, "worker"):
+            res = self.worker.set_aux_node_positions(polar_list)
+            self.add_log("Yardımcı düğüm konumları uygulandı: " + ", ".join(res.get("applied", [])))
 
     def toggle_df_mode(self, is_auto: bool):
         if self.is_capturing:
@@ -426,24 +425,25 @@ class SDRMainWindow(QMainWindow):
                 else:
                     self.analysis_panel.update_field("modulation", mod)
 
-                # Çoklama Türü (Faz 2): OFDM / Tek Taşıyıcı
-                # self.analysis_panel.update_field("multiplex", payload.get("multiplex", "Ölçülüyor..."))
+                # Çoklama Türü (5.1.2): OFDM / FDMA / DSSS-CDMA / TDMA / Tek Taşıyıcı
+                self.analysis_panel.update_field("multiplex", payload.get("multiplex", "Ölçülüyor..."))
 
-                # EKKT Tedbiri (Faz 3): FHSS / Yok
-                # self.analysis_panel.update_field("ekkt", payload.get("ekkt", "Ölçülüyor..."))
+                # EKKT Tedbiri (5.1.2): FHSS (frekans atlama) / DSSS (yayılı spektrum) / Yok
+                self.analysis_panel.update_field("ekkt", payload.get("ekkt", "Ölçülüyor..."))
 
-                # Protokol Türü (Faz 4): bant planı heuristiği (olası)
-                # self.analysis_panel.update_field("protocol", payload.get("protocol", "Ölçülüyor..."))
+                # Protokol Türü (5.1.2): bant planı + ölçülen özellikler -> olası protokol
+                self.analysis_panel.update_field("protocol", payload.get("protocol", "Ölçülüyor..."))
 
                 # Taşıyıcı Frekansı (5.1.2): ölçülen tepe frekansı
                 carrier = payload.get("carrier_mhz")
                 self.analysis_panel.update_field("carrier",
                     f"{carrier:.4f} MHz" if carrier is not None else "Sinyal yok / ölçülemedi")
 
-                # Diğer Sayısal Özellikler (5.1.2): sembol/baud hızı
-                # baud = payload.get("symbol_rate_hz", 0.0) or 0.0
-                # self.analysis_panel.update_field("digital",
-                #     f"Sembol hızı ≈ {baud/1e3:.1f} kBd" if baud > 0 else "—")
+                # Diğer Sayısal Özellikler (5.1.2): sembol/baud hızı (dijitalde) — C4FM/4FSK özeti
+                # ayrıca update_digital_voice ile "digital" alanına yazılır.
+                baud = payload.get("symbol_rate_hz", 0.0) or 0.0
+                if baud > 0:
+                    self.analysis_panel.update_field("digital", f"Sembol hızı ≈ {baud/1e3:.1f} kBd")
 
             df_rms_deg = payload.get("df_rms_deg")
             if df_rms_deg is not None:
@@ -486,8 +486,11 @@ class SDRMainWindow(QMainWindow):
 
             angles = payload["angles"]
             self.df_panel.update_angles(angles, _to_dms)
-        
+            # CANLI ham anten açısı (enkoder) — DF panelinde akıcı göster (Serial Monitor gibi)
+            self.df_panel.update_live_angle(payload.get("encoder_angle_deg"))
+
             # PPI radar: gerçek DF payload'ından (düğüm kerterizleri + üçgenleme fix'i) güncelle
+            # (payload["encoder_angle_deg"] radarda canlı yön çizgisi olarak çizilir)
             self.ppi_widget.update_ppi(payload)
         except Exception as _slot_exc:
             # GUI slot'unda beklenmedik hata olursa PyQt uygulamayı çökertebilir; yut+logla.

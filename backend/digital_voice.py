@@ -15,7 +15,11 @@ Neden harici araç: AMBE/IMBE vocoder'ları patentlidir; açık uygulaması mbel
 Kendi içimizde vocoder barındırmak yerine, olgun ve doğru DSD-FME'ye köprü kurmak profesyonel ve
 yasal olarak doğru yoldur.
 """
+import os
+import time
 import shutil
+import socket
+import threading
 import subprocess
 import numpy as np
 
@@ -219,65 +223,119 @@ def classify_fm_or_fsk(disc_audio: np.ndarray, audio_rate: float) -> dict:
 
 
 class DSDFMEDecoder:
-    """Harici DSD-FME'ye köprü: FM ayrımlayıcı sesini borular, DSD-FME çözülmüş sesi oynatır.
+    """Harici DSD-FME'ye TCP KÖPRÜSÜ: FM ayrımlayıcı sesini (48k s16le mono) bir TCP soketinden akıtır;
+    DSD-FME bu sokete client olarak bağlanıp (SDR++ standardı, port 7355) sesi çözer ve PulseAudio'ya verir.
+
+    NEDEN TCP (stdin değil): lwvmobile/dsd-fme sürümü stdin (`-i -`) KABUL ETMEZ; girişi pulse/wav/tcp/rtl'dir.
+    `-i tcp` seçeneği tam da SDR++/GNURadio'nun 48k/1 s16le ses akışını okumak içindir -> bize birebir uyar.
 
     Kurulu değilse hiçbir şey yapmaz (available()=False). Sentetik ses YOK.
     """
+
+    TCP_HOST = "127.0.0.1"
+    TCP_PORT = 7355                     # DSD-FME '-i tcp' varsayılan portu (SDR++ uyumlu)
 
     def __init__(self, audio_rate: int = 48000):
         self.audio_rate = int(audio_rate)
         self.binary = find_dsd_binary()
         self.proc = None
         self.last_error = None
+        self._srv = None               # dinleyen soket (server=biz)
+        self._conn = None              # kabul edilen client (dsd-fme)
+        self._accept_thread = None
 
     def available(self) -> bool:
         return self.binary is not None
 
     def install_hint(self) -> str:
         return ("DSD-FME kurulu değil. Sayısal ses (DMR/YSF/P25/NXDN) çözümü için: "
-                "https://github.com/lwvmobile/dsd-fme — kurup PATH'e ekleyin "
-                "(Ubuntu: derleme talimatları README'de; mbelib gerekir).")
+                "tools/install_dsd_fme.sh çalıştırın (mbelib + dsd-fme derler).")
 
     def start(self) -> bool:
-        """DSD-FME'yi stdin'den ham 48k s16le mono okuyup sesi hoparlöre verecek şekilde başlatır."""
+        """TCP server aç (7355) -> dsd-fme'yi '-i tcp -o pulse' ile başlat (client olarak bağlanır)."""
         if not self.available():
             self.last_error = "DSD-FME bulunamadı"
             return False
         if self.proc is not None:
             return True
-        # -i - : stdin; -i rawaudio olduğunu -fN/-r ile belirtiriz. DSD-FME ham girdi için:
-        #   dsd-fme -f a -i - -o pa    (auto frame, stdin, PulseAudio çıkış)
-        # Sürümler arası fark olabilir; başarısız olursa last_error'a yazılır ve False döner.
-        cmd = [self.binary, "-f", "a", "-i", "-", "-o", "pa"]
+
+        # 1) TCP server'ı KUR (dsd-fme başlamadan ÖNCE dinlemede olmalı; o bize bağlanacak)
+        try:
+            self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._srv.bind((self.TCP_HOST, self.TCP_PORT))
+            self._srv.listen(1)
+            self._srv.settimeout(8.0)
+        except OSError as e:
+            self.last_error = f"TCP {self.TCP_PORT} açılamadı (başka bir DSD/SDR++ mı kullanıyor?): {e}"
+            self._cleanup_sockets()
+            return False
+
+        # 2) Bağlantıyı arka planda bekle (dsd-fme birazdan client olarak bağlanır)
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+        # 3) dsd-fme'yi başlat. Sürüm farkı olursa DSD_FME_CMD ile komutu değiştir
+        #    (ör: export DSD_FME_CMD="dsd-fme -fa -i tcp:127.0.0.1:7355 -o pulse").
+        override = os.environ.get("DSD_FME_CMD")
+        cmd = override.split() if override else [self.binary, "-fa", "-i", "tcp", "-o", "pulse"]
         try:
             self.proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
         except Exception as e:
             self.last_error = f"DSD-FME başlatılamadı: {e}"
+            self._cleanup_sockets()
+            self.proc = None
+            return False
+
+        # 4) HEMEN KAPANDI MI? (yanlış bayrak/sürüm) -> dürüst hata
+        time.sleep(0.6)
+        if self.proc.poll() is not None:
+            self.last_error = ("DSD-FME hemen kapandı (komut/sürüm uyumsuz olabilir). Terminalde elle dene: "
+                               + " ".join(cmd) + "   |   ya da DSD_FME_CMD ile komutu ayarla.")
+            self._cleanup_sockets()
             self.proc = None
             return False
         return True
 
+    def _accept_loop(self):
+        """dsd-fme'nin TCP bağlantısını kabul et (tek client)."""
+        try:
+            conn, _ = self._srv.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._conn = conn
+        except (OSError, socket.timeout):
+            pass                         # bağlanamadıysa feed() sessizce atlar (dürüst)
+
     def feed(self, disc_audio: np.ndarray):
-        """FM ayrımlayıcı sesini (float [-1,1]) s16le'ye çevirip DSD-FME stdin'ine yazar."""
-        if self.proc is None or self.proc.stdin is None:
-            return
+        """FM ayrımlayıcı sesini (float [-1,1]) 48k s16le'ye çevirip TCP client'a (dsd-fme) gönderir."""
+        conn = self._conn
+        if conn is None:
+            return                       # dsd-fme henüz bağlanmadı (birkaç yüz ms sürebilir)
         pcm = np.clip(np.asarray(disc_audio) * 32767.0, -32768, 32767).astype("<i2")
         try:
-            self.proc.stdin.write(pcm.tobytes())
-        except Exception as e:
-            self.last_error = f"DSD-FME besleme hatası: {e}"
+            conn.sendall(pcm.tobytes())
+        except OSError as e:
+            self.last_error = f"TCP besleme hatası: {e}"
             self.stop()
 
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def _cleanup_sockets(self):
+        for s in (self._conn, self._srv):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self._conn = None
+        self._srv = None
+
     def stop(self):
         if self.proc is not None:
             try:
-                if self.proc.stdin:
-                    self.proc.stdin.close()
                 self.proc.terminate()
                 self.proc.wait(timeout=1.0)
             except Exception:
@@ -286,3 +344,4 @@ class DSDFMEDecoder:
                 except Exception:
                     pass
             self.proc = None
+        self._cleanup_sockets()

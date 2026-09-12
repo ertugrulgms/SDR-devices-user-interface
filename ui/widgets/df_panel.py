@@ -8,7 +8,7 @@ import numpy as np
 class DFPanel(QWidget):
     mode_changed = pyqtSignal(bool) # True if auto, False if manual
     manual_angle_changed = pyqtSignal(int, float) # device_index, angle
-    start_scan_clicked = pyqtSignal()
+    node_positions_changed = pyqtSignal(list)  # [(mesafe_m, açı°), ...] yardımcı düğümler için
     calibration_toggled = pyqtSignal(bool, float) # is_checked, reference_deg
     debug_iq_clicked = pyqtSignal()
 
@@ -55,6 +55,14 @@ class DFPanel(QWidget):
 
         self.rbtn_auto.toggled.connect(self.on_mode_changed)
 
+        # CANLI ANTEN AÇISI (ham enkoder) — Serial Monitor'deki gibi anlık, akıcı yön göstergesi.
+        # SDR-1/2/3 kerterizi (sinyal-tabanlı tepe) gösterir; bu ise antenin O ANKİ fiziksel yönü.
+        self.lbl_live_angle = QLabel("CANLI ANTEN AÇISI: --°")
+        self.lbl_live_angle.setStyleSheet("font-size: 17px; font-weight: bold; color: #00e5ff; "
+                                          "background-color: #10222a; padding: 4px; border-radius: 4px;")
+        self.lbl_live_angle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout_angle.addWidget(self.lbl_live_angle)
+
         self.lbl_dev1_ang = QLabel("SDR-1: --° --'")
         self.lbl_dev2_ang = QLabel("SDR-2: --° --'")
         self.lbl_dev3_ang = QLabel("SDR-3: --° --'")
@@ -92,24 +100,57 @@ class DFPanel(QWidget):
         
         layout.addWidget(self.box_angle, stretch=1)
 
-        # AĞ VE ANTEN KONTROL (SERVO)
-        self.box_antenna_ctrl = QGroupBox("AĞ VE ANTEN KONTROL (SERVO)")
+        # AĞ VE ANTEN KONTROL + YARDIMCI DÜĞÜM KONUMLARI (mesafe + pusula açısı)
+        self.box_antenna_ctrl = QGroupBox("AĞ VE YARDIMCI DÜĞÜM KONUMLARI")
         self.box_antenna_ctrl.setStyleSheet(box_style)
         layout_antenna_ctrl = QVBoxLayout(self.box_antenna_ctrl)
         layout_antenna_ctrl.setSpacing(6)
-        
+
+        # ANT-1 = ANA CİHAZ: konumu her zaman orijin (0, 0). Diğer düğümler buna GÖRE konumlanır.
         self.lbl_ant1_status = QLabel("ANT-1 (Merkez): BAĞLANTI YOK")
-        self.lbl_ant2_status = QLabel("ANT-2 (150m): BAĞLANTI YOK")
-        self.lbl_ant3_status = QLabel("ANT-3 (150m): BAĞLANTI YOK")
-        for lbl in [self.lbl_ant1_status, self.lbl_ant2_status, self.lbl_ant3_status]:
-            lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #ff5252; padding: 2px;")
-            layout_antenna_ctrl.addWidget(lbl)
-            
-        self.btn_start_scan = QPushButton("Otonom Anten Taraması Başlat")
-        self.btn_start_scan.setStyleSheet("font-size: 14px; background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px;")
-        self.btn_start_scan.clicked.connect(self.start_scan_clicked.emit)
-        layout_antenna_ctrl.addWidget(self.btn_start_scan)
-        
+        self.lbl_ant1_status.setStyleSheet("font-size: 15px; font-weight: bold; color: #ff5252; padding: 2px;")
+        layout_antenna_ctrl.addWidget(self.lbl_ant1_status)
+        lbl_ref = QLabel("Ana cihaz konumu: (0, 0) — sabit referans")
+        lbl_ref.setStyleSheet("font-size: 13px; color: #90caf9; padding: 0 0 4px 2px;")
+        layout_antenna_ctrl.addWidget(lbl_ref)
+
+        # Yardımcı düğüm giriş satırı üreten yardımcı: durum etiketi + Mesafe(m) + Açı(pusula°)
+        def _make_node_row(default_dist, default_ang):
+            status = QLabel("BAĞLANTI YOK")
+            status.setStyleSheet("font-size: 15px; font-weight: bold; color: #ff5252; padding: 2px;")
+            layout_antenna_ctrl.addWidget(status)
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            lbl_d = QLabel("Mesafe:")
+            lbl_d.setStyleSheet("font-size: 13px; color: #ffffff;")
+            spin_d = QDoubleSpinBox()
+            spin_d.setRange(0.0, 100000.0)
+            spin_d.setDecimals(0)
+            spin_d.setSuffix(" m")
+            spin_d.setValue(default_dist)
+            lbl_a = QLabel("Açı:")
+            lbl_a.setStyleSheet("font-size: 13px; color: #ffffff;")
+            spin_a = QDoubleSpinBox()
+            spin_a.setRange(0.0, 360.0)
+            spin_a.setDecimals(1)
+            spin_a.setSuffix("°")
+            spin_a.setValue(default_ang)
+            for sp in (spin_d, spin_a):
+                sp.setStyleSheet("background-color: #333333; color: white; border: 1px solid #555;")
+            row.addWidget(lbl_d); row.addWidget(spin_d)
+            row.addWidget(lbl_a); row.addWidget(spin_a)
+            layout_antenna_ctrl.addLayout(row)
+            return status, spin_d, spin_a
+
+        # Varsayılanlar DEFAULT_NODES ile uyumlu (NODE-2: 500m/90°=Doğu, NODE-3: 500m/30°)
+        self.lbl_ant2_status, self.spin_dist2, self.spin_ang2 = _make_node_row(500.0, 90.0)
+        self.lbl_ant3_status, self.spin_dist3, self.spin_ang3 = _make_node_row(500.0, 30.0)
+
+        self.btn_apply_positions = QPushButton("Konumları Uygula")
+        self.btn_apply_positions.setStyleSheet("font-size: 14px; background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px;")
+        self.btn_apply_positions.clicked.connect(self.on_apply_positions)
+        layout_antenna_ctrl.addWidget(self.btn_apply_positions)
+
         layout.addWidget(self.box_antenna_ctrl, stretch=1)
 
         # YÖN BULMA DOĞRULUĞU (KALİBRASYON)
@@ -146,6 +187,22 @@ class DFPanel(QWidget):
         # Panellerin genişliğini yarıya düşürüp sola dayamak için:
         layout.addStretch(3)
 
+    def on_apply_positions(self):
+        """Yardımcı düğüm konumlarını (mesafe + pusula açısı) topla ve yayınla. Ana cihaz (0,0) sabittir."""
+        polar_list = [
+            (self.spin_dist2.value(), self.spin_ang2.value()),
+            (self.spin_dist3.value(), self.spin_ang3.value()),
+        ]
+        self.node_positions_changed.emit(polar_list)
+
+    def set_node_positions(self, polar_list):
+        """Kayıtlı konumlarla girişleri doldur. polar_list: [(mesafe_m, açı°), ...] (yardımcı düğümler)."""
+        spins = [(self.spin_dist2, self.spin_ang2), (self.spin_dist3, self.spin_ang3)]
+        for (spin_d, spin_a), item in zip(spins, polar_list):
+            spin_d.setValue(float(item[1]))   # mesafe_m
+            spin_a.setValue(float(item[2]))   # açı°
+            # item = (id, dist, bearing) — worker.get_aux_node_positions formatı
+
     def on_mode_changed(self, is_auto: bool):
         for spin in [self.spin_dev1, self.spin_dev2, self.spin_dev3]:
             spin.setVisible(not is_auto)
@@ -173,3 +230,10 @@ class DFPanel(QWidget):
 
     def update_rms(self, rms_str):
         self.lbl_df_rms.setText(rms_str)
+
+    def update_live_angle(self, deg):
+        """Canlı ham anten açısını (enkoder) göster. None ise '--'."""
+        if deg is None:
+            self.lbl_live_angle.setText("CANLI ANTEN AÇISI: --°  (enkoder yok)")
+        else:
+            self.lbl_live_angle.setText(f"CANLI ANTEN AÇISI: {deg:.1f}°")

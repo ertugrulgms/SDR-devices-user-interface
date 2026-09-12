@@ -139,6 +139,11 @@ class TestNodeStore(unittest.TestCase):
 class TestWorkerDFIntegration(unittest.TestCase):
     def test_network_bearings_triangulate_in_worker(self):
         w = SDRWorker()
+        # Donanımdan bağımsız olsun: bu makineye bir ESP32 enkoder TAKILIYSA worker onu otomatik
+        # bağlar ve kendi self-kerterizini (sinyalsiz -> None) üretip enjekte edilen NODE-MAIN
+        # kerterizini siler. Test 3 AĞ kerterizini üçgenlemeyi doğruluyor -> encoder'ı ayır.
+        w.hw_ctrl.disconnect()
+        w.hw_ctrl.is_connected = False
         src = [300.0, 200.0, 120.0]
         for nid, cfg in w.df_registry.items():
             az, rng, el = bearing_from_positions(cfg["pos"], src)

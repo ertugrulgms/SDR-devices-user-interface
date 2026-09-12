@@ -20,7 +20,8 @@ from backend.tx_engine import TxWaveformBuilder, WIFI_BAND_CENTERS, WAV_DECEPTIO
 from backend.audio_deception import load_wav_mono
 from backend.direction_finding import (NodeBearingStore, AmplitudeDFEstimator, azel_to_unit,
                                        triangulate_lob, bearing_from_positions,
-                                       load_node_registry, self_node_id, MovingReceiverPositioner)
+                                       load_node_registry, self_node_id, MovingReceiverPositioner,
+                                       polar_to_enu, enu_to_polar, save_node_registry)
 
 # --- SOAPYSDR DONANIM KÜTÜPHANESİ KONTROLÜ ---
 import sys
@@ -43,12 +44,15 @@ CLASSIFY_TRIGGER_DB = 10.0        # OLAY EŞİĞİ: tepe-taban farkı bunu aşı
                                   # -> ağır AMC yalnızca o zaman çalışır (event-based, CPU korunur)
 CLASSIFY_SNAPSHOT_N = 32768       # ring buffer'dan alınacak kayıpsız sınıflandırma kaydı (örnek)
 LOOK_THROUGH_SIGNAL_TH_DB = 10.0  # arabakış: tepe-taban farkı bu eşiğin üstündeyse "kanalda sinyal var"
-# Aç/kapa (T/R) döngü periyodu ALT SINIRI — DONANIM KORUMASI. Bu, saniyedeki T/R geçiş sayısını
-# (ve TX kırmızı / RX yeşil LED yanıp sönme hızını) sınırlar. 20 ms çok agresifti (50 Hz geçiş ->
-# T/R anahtarı yıpranır, LED strobe gibi yanar, akış aç/kapa yükü artar). 250 ms -> en fazla ~4 Hz
-# geçiş: anahtar rahat, LED sakin, look-through hâlâ birkaç yüz ms'de bir 'peek' yaparak sinyal
-# sürekliliğini izler. Operatör daha büyük periyot seçebilir; daha küçük seçse de buraya klipslenir.
-LOOK_THROUGH_MIN_PERIOD_SEC = 0.25
+# Aç/kapa (T/R) döngü periyodu ALT SINIRI — hem DONANIM KORUMASI hem KARIŞTIRMA GÜCÜ.
+# T/R geçişinde bir "ölü zaman" var (~30-80 ms: TX akışı deaktive + tampon boşalt/doldur + oturma).
+# Periyot bu ölü zamana yakınsa cihaz ömrünün BÜYÜK KISMINI aç/kapa'yla harcar -> havaya basılan
+# RMS jam gücü DİBE ÇAKILIR ve LED saniyede defalarca yanıp söner (T/R'yi parçalar). EW kuralı:
+# "SDR'ı olabildiğince UZUN TX'te tut." Bu yüzden taban 250->500 ms: ölü zaman toplam periyodun
+# <%16'sı kalır (>%84 gerçek jam), LED en fazla ~2 Hz. Varsayılan periyot 1000 ms + duty %90 ile
+# jam ~900 ms KESİNTİSİZ tam güç, peek ~100 ms. Operatör daha da büyük periyot seçebilir; küçük
+# seçse de buraya klipslenir (kendini sabote edip gücü öldüremez).
+LOOK_THROUGH_MIN_PERIOD_SEC = 0.5
 LOOK_THROUGH_ENDED_WINDOWS = 2    # arabakış: bu kadar ardışık BOŞ dinleme penceresi -> "yayın sonlandı"
 LOOK_THROUGH_REFOCUS_HZ = 60e3   # arabakış: hedef offseti bu kadar kayarsa gücü yeniden odakla (rebuild)
 HEALTH_POLL_SEC = 2.0             # C++ akış-sağlığı sayaçlarını raporlama periyodu
@@ -99,9 +103,34 @@ class SDRWorker(QThread):
         self.node_store = NodeBearingStore(stale_sec=5.0)
         # Yerel (ana) düğümün genlik-tabanlı kerteriz kestiricisi (enkoder azimutu + ölçülen genlik).
         self.self_amp_df = AmplitudeDFEstimator()
+
+        # ENKODER (ESP32/AS5600) — GPS'TEN ÖNCE bağlanır. ESP32-S3 native USB /dev/ttyACM0'da görünür;
+        # GPS de aynı varsayılana sahip. GPS önce açarsa ESP32'nin portunu kapıp tutuyordu -> enkoder
+        # bağlanamıyordu. Bu yüzden aday portları (ttyACM0/ttyUSB0/glob) önce ENKODER dener; ilk AÇILAN
+        # porta bağlanır. Aldığı port GPS'e yasaklanır (aynı porta iki nesne açılamaz).
+        self.hw_ctrl = None
+        import glob as _glob
+        _enc_cands = ['/dev/ttyACM0', '/dev/ttyUSB0'] + sorted(_glob.glob('/dev/ttyACM*') + _glob.glob('/dev/ttyUSB*'))
+        _seen = set()
+        for _p in _enc_cands:
+            if _p in _seen:
+                continue
+            _seen.add(_p)
+            _hc = HardwareController(port=_p)
+            # ANGLE DOĞRULAMASI: yalnızca gerçekten "ANGLE:" verisi GÖNDEREN porta bağlan. ESP32-S3
+            # iki CDC arayüzü yaratır; yanlış (sessiz) porta bağlanınca "bağlı" görünüp açı GELMİYORDU.
+            if _hc.connect(verify_angle=True, verify_timeout=1.0):
+                self.hw_ctrl = _hc
+                break
+        if self.hw_ctrl is None:                       # ANGLE gören port yoksa yine de bir nesne dursun
+            self.hw_ctrl = HardwareController(port='/dev/ttyACM0')   # is_connected=False (dürüst: açı yok)
+        _enc_port = self.hw_ctrl.port if self.hw_ctrl.is_connected else None
+
         # HAREKETLİ TEK ALICI ile konum (spec 5.1.5): GPS'li platform hareket ederken farklı
         # konumlardan alınan kerterizleri biriktirip üçgenler. GPS yoksa devreye girmez (sahte yok).
-        self.gps = GPSReceiver(port="/dev/ttyACM0")
+        # ENKODER'in aldığı porta DOKUNMA (çakışma olmasın).
+        _gps_port = "/dev/ttyACM1" if _enc_port == "/dev/ttyACM0" else "/dev/ttyACM0"
+        self.gps = GPSReceiver(port=_gps_port)
         self.gps.connect()
         self.moving_positioner = MovingReceiverPositioner(min_baseline_m=15.0)
         self._gps_ref = None    # ENU orijini (ilk fix'in lat/lon/alt'ı)
@@ -159,10 +188,8 @@ class SDRWorker(QThread):
         self.logger = MissionLogger(db_name="sdr_mission_logs.db")
         self.last_log_time = 0.0
         
-        # Donanım Entegrasyonları (Sadece Anten)
-        self.hw_ctrl = HardwareController(port='/dev/ttyUSB0')
-        self.hw_ctrl.connect()
-        
+        # (Enkoder/ESP32 bağlantısı yukarıda, GPS'ten ÖNCE yapıldı — port çakışması için.)
+
         # DSP (Gerçek Ses Demodülatörü)
         self.audio_demod = AudioDemodulator(sample_rate=self.sample_rate, audio_rate=48000)
 
@@ -503,6 +530,12 @@ class SDRWorker(QThread):
         # --- RX (TX kapalı): tam analiz ---
         fft_dbm, raw_fft = self.dsp.compute_fft_dbm(iq1)
         self._last_fft_dbm = fft_dbm
+        # BANT TARAMA (5.1.1) için: ZAMAN-YUMUŞATILMAMIŞ (per-kare Welch) spektrumu ayrıca sakla.
+        # Yumuşatılmış fft_dbm'in zaman-EMA'sı (0.4/0.6) retune'da sıfırlanmadığından ÖNCEKİ frekansın
+        # spektrumunu taşır -> yavaş döngüde taramada HAYALET tespit (bir adım kaymış sahte sinyal) ya da
+        # gerçek sinyalin sönümlenmesi olur. Ham Welch spektrumu yalnızca GÜNCEL kareden gelir ->
+        # frekanslar arası kirlenme YOK; Welch segment-ortalaması sayesinde gürültü de düşük.
+        self._last_raw_fft = raw_fft
         # ZAMAN-ORTALAMA (doğrusal güç EMA, ~8 kare): gürültü varyansını düşürür -> zayıf kalıcı
         # sinyaller ortaya çıkar. Ortalanan spektrumda gürültü tepe-tabanı ~3 dB'e iner; bu yüzden
         # present_db düşürülebilir (weak sinyal yakalanır, gürültü yanlış-pozitifi olmaz).
@@ -542,12 +575,15 @@ class SDRWorker(QThread):
             if (now - self._last_classify_time) >= CLASSIFY_PERIOD_SEC:
                 snap = self._get_classify_snapshot(iq1)
                 self._clf_result = self.classifier.classify(snap, check_hopping=False)
-                # ANALOG/SAYISAL KESİNLEŞTİRME (5.1.2) — ŞİMDİLİK KAPALI: sınıflandırıcı yalnızca
-                # AM/FM (analog) döndürüyor; FM↔FSK ses-tabanlı ayrımına gerek yok. Dijital türler
-                # açılınca geri ekleyin:
-                # if "FM/FSK" in self._clf_result.get("modulation", ""):
-                #     self._refine_fm_fsk(snap)
+                # ANALOG/SAYISAL KESİNLEŞTİRME (5.1.2): sınıflandırıcı "FM/FSK" grubu döndürdüğünde
+                # (özellikten analog FM ↔ sayısal FSK ayrımı düşük SNR'de güvenilmez), SESE demodüle
+                # edip kesin karar verir -> "FM (Analog)" veya "FSK/C4FM (Sayısal, ~baud)".
+                if "FM/FSK" in self._clf_result.get("modulation", ""):
+                    self._refine_fm_fsk(snap)
                 self._clf_result["occupied_bw_hz"] = spectrum_info.get("occupied_bw_hz", 0.0)
+                # PROTOKOL (5.1.2): bant planı + ölçülen (BW/modülasyon/çoklama/EKKT) -> OLASI protokol.
+                self._clf_result["protocol"] = self.classifier.guess_protocol(
+                    self.center_freq_mhz, self._clf_result)
                 self._last_classify_time = now
         elif self.use_hardware:
             # Sinyal eşik altına düştüğünde (örn. konuşma boşluğu/fading), yazının anında 
@@ -556,11 +592,11 @@ class SDRWorker(QThread):
             if (now - self._last_valid_sig_time) > hold_time:
                 self._clf_result = {"modulation": "Sinyal yok (eşik altı)", "confidence": 0.0}
 
-        # FHSS (frekans atlama — dijital) override ŞİMDİLİK KAPALI. Yalnızca AM/FM tespit ediyoruz.
-        # Dijital türler açılınca geri ekleyin:
-        # if ekkt_hist.startswith("FHSS"):
-        #     self._clf_result["modulation"] = "FHSS (Atlamalı)"
-        #     self._clf_result["occupied_bw_hz"] = spectrum_info.get("occupied_bw_hz", 0.0)
+        # FHSS (frekans atlama — dijital EKKT) ÖRTÜŞÜ: zaman-geçmişi izleyicisi (HoppingHistoryTracker)
+        # birçok ayrık kanal arasında sıçrama gördüyse, tek-blok AMC'nin üstüne EKKT=FHSS yaz. Bu,
+        # atlama süresinden kısa tek bloğun kaçırdığı FHSS'i güvenilir yakalar (uzman eleştirisi #1).
+        if ekkt_hist.startswith("FHSS"):
+            self._clf_result["ekkt"] = f"FHSS (Frekans Atlama, ~{hop_n} sıçrama)"
         return fft_dbm, spectrum_info
 
     def _do_periodic_logging(self, target_x, target_y, df, spectrum_info, self_bearing_deg):
@@ -842,8 +878,8 @@ class SDRWorker(QThread):
         if not (self.use_hardware and hasattr(self, 'engine')):
             return
         now = time.time()
-        period = max(LOOK_THROUGH_MIN_PERIOD_SEC, self.tx_params.get("look_time_ms", 300.0) / 1000.0)
-        duty = max(0.0, min(100.0, self.tx_params.get("duty_percent", 85.0))) / 100.0
+        period = max(LOOK_THROUGH_MIN_PERIOD_SEC, self.tx_params.get("look_time_ms", 1000.0) / 1000.0)
+        duty = max(0.0, min(100.0, self.tx_params.get("duty_percent", 90.0))) / 100.0
         on_dur = period * duty
         off_dur = period * (1.0 - duty)
         elapsed = now - getattr(self, "_lt_phase_start", now)
@@ -1001,7 +1037,9 @@ class SDRWorker(QThread):
         if now < self._scan_settle_until:
             return   # retune sonrası oturma; bu pencerede tespit yapma (geçiş bozması olmasın)
 
-        fft = getattr(self, "_last_fft_dbm", None)
+        # HAM (zaman-yumuşatılmamış) Welch spektrumu kullan -> retune'da frekanslar arası EMA
+        # kirlenmesi/hayalet tespit YOK (bkz. _run_signal_analysis'teki _last_raw_fft notu).
+        fft = getattr(self, "_last_raw_fft", None)
         if fft is not None and len(fft) > 0:
             # TARİHSEL-MİN gürültü tabanı (bu merkez frekans için) — self-masking'e bağışık (uzman #1)
             ckey = round(self.center_freq_mhz * 10)
@@ -1153,6 +1191,35 @@ class SDRWorker(QThread):
         """DF kalibrasyon modunu kapatır."""
         self.df_tracker.clear_reference()
         self.log_signal.emit("Backend: DF Kalibrasyonu durduruldu.")
+
+    def get_aux_node_positions(self) -> list:
+        """Yardımcı (self-olmayan) düğümlerin KUTUPSAL konumunu döndürür: [(id, mesafe_m, açı°), ...].
+        Ana cihaz (self) daima 0,0'dır; listede yer almaz. Arayüz başlangıçta girdileri bununla doldurur."""
+        out = []
+        for nid, cfg in self.df_registry.items():
+            if cfg.get("self"):
+                continue
+            dist, bearing = enu_to_polar(cfg.get("pos", [0.0, 0.0, 0.0]))
+            out.append((nid, dist, bearing))
+        return out
+
+    def set_aux_node_positions(self, polar_list: list) -> dict:
+        """Yardımcı düğümlerin konumunu MESAFE (m) + PUSULA AÇISI (°) ile ayarlar.
+        polar_list: [(mesafe_m, açı°), ...] — registry sırasındaki self-olmayan düğümlerle eşlenir.
+        Ana cihaz (self) daima [0,0,0] sabit tutulur. ENU'ya çevrilip df_nodes.json'a yazılır
+        (kalıcı). Konum belirleme üçgenlemesi (5.1.5) bu konumları kullanır."""
+        aux_ids = [nid for nid, cfg in self.df_registry.items() if not cfg.get("self")]
+        applied = []
+        for (dist, bearing), nid in zip(polar_list, aux_ids):
+            self.df_registry[nid]["pos"] = polar_to_enu(dist, bearing)
+            applied.append(f"{nid}={float(dist):.0f}m @ {float(bearing):.0f}°")
+        # Ana cihaz konumu her zaman orijin (0,0,0)
+        if self.self_id in self.df_registry:
+            self.df_registry[self.self_id]["pos"] = [0.0, 0.0, 0.0]
+        saved = save_node_registry(self.df_registry)
+        self.log_signal.emit("Backend: Düğüm konumları güncellendi -> " + ", ".join(applied)
+                             + (" (kaydedildi)" if saved else " (KAYDEDİLEMEDİ)"))
+        return {"applied": applied, "saved": saved}
 
     def stop(self):
         self._is_running = False
@@ -1453,14 +1520,19 @@ class SDRWorker(QThread):
                 # --- SİNYAL İZLEME/TAKİP (5.1.3): süreklilik + parametre geçmişi ---
                 self._update_monitor(iq1, spectrum_info)
 
-                # --- ANALOG/SAYISAL AYRIMI ---
-                # ŞİMDİLİK sadece AM/FM (analog) tespit ediyoruz; ikisi de ANALOG. Sınıflandırıcı
-                # sadece "AM.../FM..." veya "Sinyal yok/Belirlenemedi/Ölçülüyor" döndürür.
-                # (Dijital türler açılınca SAYISAL dalını geri ekleyin — bkz. signal_classifier._decide.)
+                # --- ANALOG/SAYISAL AYRIMI (5.1.2) ---
+                # Modülasyon etiketinden türetilir. ANALOG: AM, FM. SAYISAL: PSK/QAM/OFDM/FSK-C4FM/FHSS.
+                # "FM/FSK" (henüz ses-kesinleştirmesi olmayan grup) -> "belirleniyor" (dürüst, sahte değil).
                 mod_str = self._clf_result.get("modulation", "")
+                ad = self._clf_result.get("analog_digital")   # _refine_fm_fsk kesinleştirdiyse dolu
                 if any(s in mod_str for s in ("Sinyal yok", "Belirlenemedi", "Ölçülüyor")):
                     ana_dig_tag = " (Sınıflandırılıyor...)"
-                elif "AM" in mod_str or "FM" in mod_str:
+                elif "FM/FSK" in mod_str:                      # henüz ses-kesinleştirmesi yok (grup)
+                    ana_dig_tag = " (Analog/Sayısal: sesle belirleniyor)"
+                elif ad == "Sayısal" or any(t in mod_str for t in
+                        ("PSK", "QAM", "OFDM", "FSK", "C4FM", "FHSS", "Sayısal")):
+                    ana_dig_tag = " [SAYISAL KESİN]"
+                elif ad == "Analog" or "AM (" in mod_str or "FM (" in mod_str:
                     ana_dig_tag = " [ANALOG KESİN]"
                 else:
                     ana_dig_tag = ""
@@ -1513,6 +1585,11 @@ class SDRWorker(QThread):
                                      if (self.tx_active and self.tx_params.get("mode") == "LOOK_THROUGH")
                                      else None),
                     "ant_status": self.hw_ctrl.is_connected,
+                    # CANLI HAM ENKODER AÇISI (Serial Monitor'deki gibi anlık anten yönü). Kerteriz
+                    # (df_self_bearing) sinyal-tabanlı bir TEPE'dir; bu ise antenin O ANKİ fiziksel
+                    # yönü -> hızlı dönüşte bile akıcı takip. DF paneli + radar canlı yön çizgisi kullanır.
+                    "encoder_angle_deg": (self.hw_ctrl.get_angle()
+                                          if (self.hw_ctrl is not None and self.hw_ctrl.is_connected) else None),
                     # Gerçek ölçülen sinyal analizi (5.1.2)
                     "occupied_bw_hz": spectrum_info["occupied_bw_hz"],
                     "signal_class": spectrum_info["signal_class"] + ana_dig_tag,

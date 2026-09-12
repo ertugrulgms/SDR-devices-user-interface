@@ -92,17 +92,19 @@ class TxDialog(QDialog):
         layout_inter.setSpacing(14)
         
         layout_inter.addWidget(QLabel("Aralıklı (Look-Through) Karıştırma Parametreleri:"))
-        layout_inter.addWidget(QLabel("Yayın Süresi (Duty Cycle %) — yüksek = daha uzun TX:"))
-        self.txt_duty = QLineEdit("85")
+        layout_inter.addWidget(QLabel("Yayın Süresi (Duty Cycle %) — yüksek = daha uzun TX = daha güçlü jam:"))
+        self.txt_duty = QLineEdit("90")
         self.txt_duty.setValidator(percent_val)
         layout_inter.addWidget(self.txt_duty)
 
         layout_inter.addWidget(QLabel("Döngü Periyodu (ms) — aç/kapa döngüsü:"))
-        self.txt_look_time = QLineEdit("300")
+        self.txt_look_time = QLineEdit("1000")
         self.txt_look_time.setValidator(double_val)
         layout_inter.addWidget(self.txt_look_time)
-        _hint = QLabel("Küçük değer = hızlı T/R geçişi (LED strobe, anahtar yıpranır).\n"
-                       "Donanım koruması için en az 250 ms uygulanır. Öneri: 300–500 ms.")
+        _hint = QLabel("KÜÇÜK periyot = cihaz ömrünü aç/kapa (ölü zaman) ile harcar -> jam gücü DİBE "
+                       "çakılır, LED strobe. BÜYÜK periyot + yüksek duty = uzun KESİNTİSİZ tam-güç jam.\n"
+                       "Donanım koruması için en az 500 ms uygulanır. Öneri: 1000–2000 ms, duty %90.\n"
+                       "Peek gerekmiyorsa maksimum güç için 'Sürekli Karıştırma' sekmesini kullan.")
         _hint.setStyleSheet("color:#9aa4b0; font-size:11px;")
         _hint.setWordWrap(True)
         layout_inter.addWidget(_hint)
@@ -254,8 +256,8 @@ class TxDialog(QDialog):
             # JSR kaldırıldı: dijital sürüş tam-skalaya sabit (20 dB = tavan); güç yalnızca TX kazancı.
             "jsr_db": 20.0,
             "tx_gain_db": float(self.txt_tx_gain.text() or 80.0),
-            "duty_percent": float(self.txt_duty.text() or 85.0),
-            "look_time_ms": float(self.txt_look_time.text() or 300.0),
+            "duty_percent": float(self.txt_duty.text() or 90.0),
+            "look_time_ms": float(self.txt_look_time.text() or 1000.0),
             "wave_type": self.cmb_wave.currentText(),
             "offset_ms": 12.0,   # sentetik dalgalar için sabit; WAV modunda kullanılmaz (UI alanı kaldırıldı)
             # Gerçek ses aldatma (5.2.3): WAV mesaj + hedefe uygun modülasyon/sapma + CTCSS tonu

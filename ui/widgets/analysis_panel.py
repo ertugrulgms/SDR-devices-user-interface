@@ -36,15 +36,14 @@ class AnalysisPanel(QWidget):
         self.power_label = QLabel()
         self.signal_type_label = QLabel()
         self.modulation_label = QLabel()
-        # self.protocol_label = QLabel()
-        # self.multiplex_label = QLabel()
-        # self.ekkt_label = QLabel()
-        # self.digital_label = QLabel()
+        self.protocol_label = QLabel()
+        self.multiplex_label = QLabel()
+        self.ekkt_label = QLabel()
+        self.digital_label = QLabel()
 
         for _lbl in (self.carrier_label, self.bandwidth_label, self.power_label, self.signal_type_label,
-                     self.modulation_label):
-                     # self.protocol_label, self.multiplex_label,
-                     # self.ekkt_label, self.digital_label):
+                     self.modulation_label, self.protocol_label, self.multiplex_label,
+                     self.ekkt_label, self.digital_label):
             _lbl.setWordWrap(True)
             _lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #cccccc;")
             layout.addWidget(_lbl)
@@ -55,10 +54,10 @@ class AnalysisPanel(QWidget):
             "power": AnalysisField(self.power_label, "Güç Seviyesi (Tepe): "),
             "signal_type": AnalysisField(self.signal_type_label, "Analog/Sayısal Ayrımı: "),
             "modulation": AnalysisField(self.modulation_label, "Modülasyon Türü: "),
-            # "protocol": AnalysisField(self.protocol_label, "Protokol Türü: "),
-            # "multiplex": AnalysisField(self.multiplex_label, "Çoklama Türü: "),
-            # "ekkt": AnalysisField(self.ekkt_label, "EKKT Tedbiri (FHSS/DSSS): "),
-            # "digital": AnalysisField(self.digital_label, "Diğer Sayısal Özellikler: "),
+            "protocol": AnalysisField(self.protocol_label, "Protokol Türü: "),
+            "multiplex": AnalysisField(self.multiplex_label, "Çoklama Türü: "),
+            "ekkt": AnalysisField(self.ekkt_label, "EKKT Tedbiri (FHSS/DSSS): "),
+            "digital": AnalysisField(self.digital_label, "Diğer Sayısal Özellikler: "),
         }
         
         # İlk değerleri yazdır

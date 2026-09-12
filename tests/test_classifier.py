@@ -22,10 +22,16 @@ FS = 2.4e6
 N = 8192
 
 
-# SADECE ANALOG çıktı: AM (genlik) / FM (frekans).
+# Modülasyon çıktı etiketleri. FM/2FSK -> "FM/FSK (Frekans Mod.)" grubu döner (analog FM ↔ sayısal
+# FSK ayrımı SESLE, worker._refine_fm_fsk ile yapılır; sınıflandırıcı özellikten güvenilir ayıramaz).
 _EXPECTED = {
-    "AM": "AM (Analog-Genlik)",
-    "FM": "FM (Analog-Frekans)",
+    "AM":    "AM (Analog-Genlik)",
+    "FM":    "FM/FSK (Frekans Mod.)",
+    "2FSK":  "FM/FSK (Frekans Mod.)",
+    "BPSK":  "BPSK (Sayısal-Faz)",
+    "QPSK":  "QPSK (Sayısal-Faz)",
+    "8PSK":  "8PSK (Sayısal-Faz)",
+    "16QAM": "QAM (Sayısal-Genlik)",
 }
 
 
@@ -51,17 +57,22 @@ class TestModulationClassification(unittest.TestCase):
     def test_fm_high_snr(self):
         self.assertEqual(_majority_vote("FM", 18), _expected("FM"))
 
-    # --- DİJİTAL TÜRLER ŞİMDİLİK KAPALI (sınıflandırıcıda yorumda) --------------------
-    # def test_bpsk_high_snr(self):
-    #     self.assertEqual(_majority_vote("BPSK", 18), "PSK (Sayısal-Faz)")
-    # def test_qpsk_high_snr(self):
-    #     self.assertEqual(_majority_vote("QPSK", 18), "PSK (Sayısal-Faz)")
-    # def test_8psk_high_snr(self):
-    #     self.assertEqual(_majority_vote("8PSK", 18), "PSK (Sayısal-Faz)")
-    # def test_qam_high_snr(self):
-    #     self.assertEqual(_majority_vote("16QAM", 18), "QAM (Sayısal-Genlik)")
-    # def test_fsk_maps_to_frequency_family(self):
-    #     self.assertEqual(_majority_vote("2FSK", 18), "FM/FSK/PM (Açı Mod.)")
+    # --- DİJİTAL TÜRLER (ampirik kalibrasyonla açıldı — 13-25 dB'de %100 ayrım) ---------
+    def test_bpsk_high_snr(self):
+        self.assertEqual(_majority_vote("BPSK", 18), _expected("BPSK"))
+
+    def test_qpsk_high_snr(self):
+        self.assertEqual(_majority_vote("QPSK", 18), _expected("QPSK"))
+
+    def test_8psk_high_snr(self):
+        self.assertEqual(_majority_vote("8PSK", 18), _expected("8PSK"))
+
+    def test_qam_high_snr(self):
+        self.assertEqual(_majority_vote("16QAM", 18), _expected("16QAM"))
+
+    def test_fsk_maps_to_frequency_family(self):
+        # 2FSK sabit-zarf açı modülasyonu -> "FM/FSK" grubu (analog/sayısal ayrımı sesle)
+        self.assertEqual(_majority_vote("2FSK", 18), _expected("2FSK"))
 
 
 class TestHonesty(unittest.TestCase):

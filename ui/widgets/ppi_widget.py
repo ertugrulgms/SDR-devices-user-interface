@@ -65,6 +65,12 @@ class PPIWidget(QWidget):
                                                  brush=pg.mkBrush('#ff1744'))
         self.plot.addItem(self.target_scatter)
 
+        # CANLI ANTEN YÖN ÇİZGİSİ (ham enkoder açısı) — merkezden antenin O ANKİ yönüne uzanan,
+        # antenle birlikte AKICI dönen parlak süpürme çizgisi (Serial Monitor'deki açı gibi anlık).
+        self.heading_line = pg.PlotDataItem([0, 0], [0, 0],
+                                            pen=pg.mkPen('#00e5ff', width=3))
+        self.plot.addItem(self.heading_line)
+
     # ------------------------------------------------------------------ #
     def _draw_static(self):
         """Menzil halkaları + eksen çizgileri + K/D/G/B etiketleri (mevcut menzile göre)."""
@@ -144,6 +150,15 @@ class PPIWidget(QWidget):
 
     def update_ppi(self, payload):
         """Worker payload'ından PPI'yı günceller: düğüm konumları/kerterizleri + hedef blip."""
+        # CANLI ANTEN YÖN ÇİZGİSİ (ham enkoder açısı) — antenle birlikte akıcı döner. Kerterizden
+        # (sinyal-tabanlı tepe) BAĞIMSIZDIR; anten fiziksel olarak nereye bakıyorsa oraya uzanır.
+        enc = payload.get("encoder_angle_deg")
+        if enc is not None:
+            hx, hy = self._azr_to_xy(float(enc), self._max_range_m)
+            self.heading_line.setData([0.0, hx], [0.0, hy])
+        else:
+            self.heading_line.setData([0.0, 0.0], [0.0, 0.0])
+
         self._update_moving_label(payload.get("df_moving"))
         nodes = payload.get("df_nodes", {}) or {}
         fix = payload.get("df_fix", False)

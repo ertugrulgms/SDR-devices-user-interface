@@ -378,12 +378,14 @@ class AuxWorker(QThread):
         self.sdr = make_sdr(cfg)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._last_send = 0.0
+        self._last_bearing = None        # son BULUNAN kerteriz (sabit dururken göndermeye devam)
 
     # --- arayüzden gelen kontroller ---
     def set_frequency_mhz(self, mhz):
         self.freq_hz = mhz * 1e6
         self.sdr.set_frequency(self.freq_hz)
         self.df.reset()                 # frekans değişti -> eski açı-güç haritası geçersiz
+        self._last_bearing = None       # önbellekli kerterizi de temizle (yeni frekans = yeni hedef)
         self.log.emit(f"Frekans -> {mhz:.4f} MHz (kerteriz sıfırlandı)")
 
     def set_gain(self, g):
@@ -396,6 +398,7 @@ class AuxWorker(QThread):
 
     def reset_bearing(self):
         self.df.reset()
+        self._last_bearing = None       # önbellekli kerterizi de temizle
         self.log.emit("Kerteriz sıfırlandı — yeni tarama için anteni döndürün.")
 
     def set_sending(self, on):
@@ -452,16 +455,26 @@ class AuxWorker(QThread):
                 self.df.update(az, peak_dbm)
             bearing, bpk, conf, ncnt = self.df.bearing()
 
+            # SON KERTERİZİ ÖNBELLEKLE: genlik-DF ≥3 taze açı-bin'i ister; anten SABİT dururken bin'ler
+            # söner (<3) -> bearing None olur. O anda gönderim durursa ana cihaz düğümü "koptu" (kırmızı)
+            # sanır — oysa düğüm CANLI, yalnızca yeni kerteriz yok. Son bulunan kerterizi tutup
+            # göndermeye devam et -> bağlantı YEŞİL kalır, kerteriz kalıcı olur (sabit istasyon/hedef).
+            # Yeni tarama (anteni çevirince) ya da frekans/reset ile önbellek güncellenir/temizlenir.
+            if bearing is not None:
+                self._last_bearing = (bearing, bpk, conf, ncnt)
+            tx = self._last_bearing
+
             # 4) Merkeze kerteriz gönder (JSON/UDP) — hız sınırlı
             sent = False
             now = time.time()
             _rate_hz = self.cfg.get("rate_hz") or 10.0     # None/eksikse güvenli varsayılan (çökme yok)
-            if self.sending and bearing is not None and (now - self._last_send) >= (1.0 / _rate_hz):
+            if self.sending and tx is not None and (now - self._last_send) >= (1.0 / _rate_hz):
+                _b_az, _b_pk = tx[0], tx[1]
                 msg = {
                     "id": self.cfg["id"],
-                    "azimuth_deg": round(bearing, 2),
+                    "azimuth_deg": round(_b_az, 2),
                     "elevation_deg": 0.0,
-                    "amp_dbm": round(bpk, 1),
+                    "amp_dbm": round(_b_pk, 1),
                     "snr_db": round(snr_db, 1),
                     "freq_mhz": round(self.freq_hz / 1e6, 4),
                 }
