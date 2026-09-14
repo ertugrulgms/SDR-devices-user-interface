@@ -7,7 +7,7 @@ import pyqtgraph as pg
 
 from backend.sdr_worker import SDRWorker
 from ui.widgets import (ControlPanel, AnalysisPanel, SpectrumWidget,
-                        DFPanel, PPIWidget, TxDialog, DetectionPanel)
+                        DFPanel, PPIWidget, TxDialog, DetectionPanel, ChatPanel)
 
 FFT_POINTS = 2048
 WATERFALL_HISTORY = 100
@@ -66,7 +66,11 @@ class SDRMainWindow(QMainWindow):
 
         self.spectrum_widget = SpectrumWidget()
         self.df_panel = DFPanel()
-        
+        # SAHA SOHBETİ: DF panelinin (kalibrasyon kutusunun) SAĞINA, radarın üstüne yerleşir.
+        # Geniş stretch (3) ile eski boşluğu doldurup sola doğru uzanır.
+        self.chat_panel = ChatPanel()
+        self.df_panel.layout().addWidget(self.chat_panel, stretch=3)
+
         right_layout.addWidget(self.spectrum_widget, stretch=8)
         right_layout.addWidget(self.df_panel, stretch=2)
 
@@ -125,9 +129,16 @@ class SDRMainWindow(QMainWindow):
         self.worker = SDRWorker()
         self.worker.data_ready.connect(self.update_gui_from_worker)
         self.worker.log_signal.connect(self.add_log)
+        # SAHA SOHBETİ: giden mesaj -> worker (UDP dağıt); gelen mesaj -> panele ekle
+        self.chat_panel.send_requested.connect(self.worker.send_chat)
+        self.worker.chat_signal.connect(self._on_chat_message)
 
         self.setup_connections()
         self.add_log("Arayüz başarıyla başlatıldı. Cihaz bağlantısı bekleniyor...")
+
+    def _on_chat_message(self, msg):
+        """Worker'dan gelen sohbet mesajını panele ekle (aux veya merkez)."""
+        self.chat_panel.add_message(msg.get("from", "?"), msg.get("text", ""), msg.get("ts"))
 
     def closeEvent(self, event):
         if getattr(self.worker, '_is_running', False):
@@ -144,6 +155,7 @@ class SDRMainWindow(QMainWindow):
         self.control_panel.toggle_capture.connect(self.handle_capture_toggle)
         self.control_panel.open_tx_dialog.connect(self.open_tx_dialog)
         self.control_panel.scan_toggled.connect(self.handle_scan_toggle)
+        self.control_panel.scan_sensitivity_changed.connect(self.worker.set_scan_sensitivity)
         # Tespit paneli: çift tıkla -> o frekansa tune;  dışa aktarma -> log
         self.detection_panel.tune_requested.connect(self.tune_to_detection)
         self.detection_panel.exported.connect(
@@ -541,6 +553,8 @@ class SDRMainWindow(QMainWindow):
             self.df_panel.update_angles(angles, _to_dms)
             # CANLI ham anten açısı (enkoder) — DF panelinde akıcı göster (Serial Monitor gibi)
             self.df_panel.update_live_angle(payload.get("encoder_angle_deg"))
+            # AUX (NODE-2/3) canlı anten açısı — SDR-2/3 satırında anlık (kerterizin 15 sn gecikmesini beklemez)
+            self.df_panel.update_node_live_angles(payload.get("node_live_angles"))
 
             # PPI radar: gerçek DF payload'ından (düğüm kerterizleri + üçgenleme fix'i) güncelle
             # (payload["encoder_angle_deg"] radarda canlı yön çizgisi olarak çizilir)

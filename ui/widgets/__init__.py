@@ -5,3 +5,4 @@ from .df_panel import DFPanel
 from .ppi_widget import PPIWidget
 from .tx_dialog import TxDialog
 from .detection_panel import DetectionPanel
+from .chat_panel import ChatPanel

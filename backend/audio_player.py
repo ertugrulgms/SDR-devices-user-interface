@@ -36,6 +36,13 @@ class AudioPlayer:
         self._queue = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
         self._muted = True          # başlangıçta sustur (kullanıcı "Dinle" deyince açılır)
+        self._squelch_open = True   # SQUELCH: kanalda sinyal yoksa worker bunu False yapar -> ses susar
+                                    # (sürekli AGC-yükseltilmiş cızırtı yerine sessizlik). Analog telsizde kritik.
+        # ÖN-TAMPON (jitter buffer): callback, kuyrukta en az bu kadar ses birikmeden ÇALMAZ. Üretici
+        # (SDR akışı) ile ses DAC saati birebir aynı olmadığından kuyruk ara ara boşalır -> her boşalma
+        # bir "tık/çıtırtı"dır. ~80 ms tampon bu underrun'ları yutar -> pürüzsüz ses.
+        self._primed = False
+        self._prebuffer_n = max(256, int(self.out_rate * 0.08))
         self._running = False
         self._stream = None
         self._thread = None
@@ -78,6 +85,11 @@ class AudioPlayer:
 
     def set_muted(self, muted: bool):
         self._muted = bool(muted)
+
+    def set_squelch_open(self, is_open: bool):
+        """SQUELCH: kanalda yeterli sinyal varsa True (ses geçer), yoksa False (sustur). Worker,
+        ölçtüğü kanal SNR'ına göre çağırır -> sinyal yokken sürekli cızırtı/hışırtı DUYULMAZ."""
+        self._squelch_open = bool(is_open)
 
     def set_digital(self, enabled: bool, key: str = None) -> dict:
         """Sayısal çözmeyi aç/kapat. key verilirse (ondalık DMR Basic Privacy anahtarı) şifreli yayın
@@ -133,6 +145,7 @@ class AudioPlayer:
             self.demod.reset()
             with self._lock:
                 self._queue = np.zeros(0, dtype=np.float32)
+                self._primed = False        # yeni başlangıç -> önce tampon dolsun
             self._stream = _sd.OutputStream(
                 samplerate=self.out_rate, channels=1, dtype="float32",
                 blocksize=1024, callback=self._sd_callback,
@@ -188,8 +201,11 @@ class AudioPlayer:
                             self.dsd.feed(disc)
                         # Ham diskriminatörü hoparlöre BASMA (DSD kendi çözülmüş sesini oynatır).
                     else:
+                        # Demodü HER ZAMAN çalıştır (filtre/faz durumu sürekli kalsın), ama SQUELCH
+                        # KAPALIYSA sesi kuyruğa YAZMA -> kuyruk boşalır, callback sessizlik basar
+                        # (sinyal yokken sürekli AGC-yükseltilmiş cızırtı duyulmaz).
                         audio = self.demod.process(iq)
-                        if len(audio):
+                        if len(audio) and self._squelch_open:
                             with self._lock:
                                 self._queue = np.concatenate([self._queue, audio])
                                 if len(self._queue) > self._MAX_QUEUE:
@@ -208,6 +224,14 @@ class AudioPlayer:
             outdata[:] = 0.0
             return
         with self._lock:
+            # ÖN-TAMPON: yeterli ses birikmeden çalma (tık/çıtırtı önle). Kuyruk tamamen boşalırsa
+            # (underrun) yeniden tampon moduna geç -> sürekli parçalı ses yerine kısa sessizlik + temiz akış.
+            if not self._primed:
+                if len(self._queue) >= self._prebuffer_n:
+                    self._primed = True
+                else:
+                    outdata[:] = 0.0
+                    return
             n = min(frames, len(self._queue))
             if n > 0:
                 outdata[:n, 0] = self._queue[:n]
@@ -215,3 +239,5 @@ class AudioPlayer:
             if n < frames:
                 outdata[n:, 0] = 0.0
                 self._underruns += 1
+                if n == 0:
+                    self._primed = False        # kuyruk bitti -> yeniden tampon (glitch selini kes)

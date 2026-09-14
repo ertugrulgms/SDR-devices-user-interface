@@ -43,6 +43,10 @@ TX_GAIN_MAX_DB = 89.75            # B200mini TX kazanç üst sınırı
 CLASSIFY_PERIOD_SEC = 0.5         # olay tetiklendiğinde ağır AMC en fazla bu sıklıkta çalışır
 CLASSIFY_TRIGGER_DB = 10.0        # OLAY EŞİĞİ: tepe-taban farkı bunu aşınca sinyal "var" sayılır
                                   # -> ağır AMC yalnızca o zaman çalışır (event-based, CPU korunur)
+AUDIO_SQUELCH_SNR_DB = 8.0        # SES SQUELCH: kanal SNR'ı bunun altındaysa ses susar (sürekli
+                                  # AGC-yükseltilmiş cızırtı yerine sessizlik). set_squelch_snr_db ile ayarlanır
+AUDIO_CENTER_MAX_HZ = 200_000.0   # ses oto-merkezleme: yalnızca ±bu kadar kaymayı düzelt (tüm bandı
+                                  # tarayıp uzak spur'a kilitlenme). Dinleme her BW'de merkezde çalışır.
 CLASSIFY_SNAPSHOT_N = 32768       # ring buffer'dan alınacak kayıpsız sınıflandırma kaydı (örnek)
 LOOK_THROUGH_SIGNAL_TH_DB = 10.0  # arabakış: tepe-taban farkı bu eşiğin üstündeyse "kanalda sinyal var"
 # Aç/kapa (T/R) döngü periyodu ALT SINIRI — hem DONANIM KORUMASI hem KARIŞTIRMA GÜCÜ.
@@ -69,6 +73,20 @@ SCAN_DETECT_DB = 10.0             # sinyal, TARİHSEL-MİN gürültü tabanını
 SCAN_SETTLE_SEC = 0.04           # retune sonrası oturma; kısa tutuldu (FHSS/burst POI için, uzman #3)
 SCAN_MERGE_MHZ = 0.05            # bu aralıktaki tespitler aynı sinyal sayılır (birleştirilir)
 SCAN_MAX_DETECTIONS = 400        # tespit listesi üst sınırı
+SCAN_CONFIRM_HITS = 2            # bir aday, listeye/loga girmeden önce bu kadar AYRI turda görülmeli
+                                 # (tek-karelik gürültü sıçramaları rastgele bin'lerde olur -> asla
+                                 #  aynı frekansta 2 kez üst üste gelmez -> yalancı-pozitif elenir)
+SCAN_CANDIDATE_TTL_SEC = 8.0     # onaylanmamış aday bu süre yeniden görülmezse düşürülür (bellek+temizlik)
+SCAN_DC_GUARD_BINS = 4           # pencere merkezindeki (n/2) DAR DC/LO sızıntı tepesini ele (B200 offset)
+SCAN_CLOSE_GAP_HZ = 15_000       # bu kadar kısa eşik-altı boşluklar kapatılır -> dalgalı geniş sinyal
+                                 # tek tespit olur (Welch/interp dalgalanmasıyla parçalanma önlenir)
+SCAN_SHOULDER_DB = 22.0          # bir tespit, YAKIN + çok daha güçlü bir sinyalin "omuz/etek" gölgesinde
+                                 # (bu kadar dB zayıf) ise AYRI sinyal sayılmaz (baskın taşıyıcı eteği)
+SCAN_SHOULDER_SPAN_MULT = 1.5    # gölge yarıçapı = güçlü sinyalin bant genişliği × bu
+SCAN_SHOULDER_MIN_MHZ = 0.10     # minimum gölge yarıçapı (dar taşıyıcının yakın etekleri için)
+SCAN_PROMINENCE_DB = 12.0        # CFAR: tespit, YEREL çevre tabanını bu kadar aşmalı (varsayılan
+                                 # hassasiyet). Güçlü taşıyıcının yükselttiği DÜZ gürültü tabanını eler;
+                                 # gerçek TEPE'yi tutar. Sürgüyle ayarlanabilir (set_scan_sensitivity).
 # --- OTOMATİK KAZANÇ KONTROLÜ (AGC) ---
 RX_GAIN_MAX_DB = 76.0             # B200mini RX kazanç üst sınırı
 AGC_INTERVAL_SEC = 0.3            # AGC en fazla bu sıklıkta kazanç değiştirir (donanım otursun)
@@ -88,6 +106,7 @@ class SDRWorker(QThread):
     data_ready = pyqtSignal(dict)
     log_signal = pyqtSignal(str)
     status_signal = pyqtSignal(bool)
+    chat_signal = pyqtSignal(dict)     # aux<->merkez sohbet mesajı {from, text, ts}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,6 +157,11 @@ class SDRWorker(QThread):
         self._gps_ref = None    # ENU orijini (ilk fix'in lat/lon/alt'ı)
         self.udp_thread = None
         self.udp_socket = None
+        # SOHBET (aux<->merkez, UDP 5006). Merkez=hub: gelen mesajı diğer düğümlere dağıtır.
+        self.chat_thread = None
+        self.chat_socket = None
+        self._chat_peers = {}          # node_id -> ip (kerteriz/canlı paketlerin adresinden öğrenilir)
+        self.CHAT_PORT = 5006
 
         self.center_freq_mhz = 2400.0
         self.gain_db = 40.0
@@ -153,6 +177,7 @@ class SDRWorker(QThread):
         # Tembel (lazy) kurulur: yalnızca donanım çalışırken ve kullanıcı "Dinle" dediğinde.
         self.audio_player = None
         self.audio_mode = "FM"
+        self.audio_squelch_snr_db = AUDIO_SQUELCH_SNR_DB   # ses squelch eşiği (ayarlanabilir)
 
         # Sinyal izleme/takip (spec 5.1.3): ayarlı frekansa kilitlen, sürekliliği + parametre
         # geçmişini (frekans/güç/BW sapması) izle. Tarama/TX sırasında askıya alınır.
@@ -218,6 +243,8 @@ class SDRWorker(QThread):
         self.scan_cursor_mhz = 0.0
         self._scan_settle_until = 0.0
         self.scan_detections = {}     # key -> {freq_mhz, power_dbfs, snr_db, bw_mhz, ts, count} (Max-Hold)
+        self._scan_candidates = {}    # key -> aday (onay için); SCAN_CONFIRM_HITS turda görülünce PROMOTE
+        self.scan_prominence_db = SCAN_PROMINENCE_DB   # CFAR yerel-belirginlik eşiği (sürgü ayarlar)
         self._nf_trackers = {}        # merkez-frekans -> NoiseFloorTracker (tarihsel-min gürültü tabanı)
 
         # Kapalı-çevrim akıllı karıştırma: son ölçülen hedef sinyalin bandı/offseti (RX'ten).
@@ -619,17 +646,27 @@ class SDRWorker(QThread):
         self._last_measured_bw_hz = float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0)
         self._last_peak_offset_hz = (peak_bin - len(fft_dbm) / 2.0) / len(fft_dbm) * self.sample_rate
 
-        # OTOMATİK MERKEZLEME (dinleme): en güçlü sinyalin offsetini ses demoduna ver -> operatör tam
-        # tune etmese bile demod sinyali DC'ye çeker (merkez-dışı sinyal süzülüp gürültü kalmasın).
-        # Yalnızca makul mistune aralığında (±150 kHz) uygula; uzak bir sinyale sıçrayıp yanlış
-        # merkezleme yapmasın. Sinyal varken (SNR yeterli) geçerli, aksi halde 0 (merkez).
+        # OTOMATİK MERKEZLEME (dinleme): ses HER ZAMAN TUNE EDİLEN MERKEZDE demodüle edilir (kullanıcı
+        # telsiz frekansına tune eder -> sinyal DC'dedir). Auto-center yalnızca KÜÇÜK bir kaymayı
+        # (±AUDIO_CENTER_MAX_HZ) düzeltir; TÜM bandı tarayıp uzak bir spur'a/DC'ye kilitlenmez. (Eski
+        # "tüm bant" davranışı geniş bantta (5-10 MHz) yanlış sinyale kilitlenip telsizi kaçırıyordu.)
+        # Böylece dinleme HER bant genişliğinde çalışır: yeter ki telsizin frekansına tune et.
         if getattr(self, "audio_player", None) is not None and self.audio_player.is_running():
-            off = self._last_peak_offset_hz if (sig_snr >= 6.0 and abs(self._last_peak_offset_hz) < 150e3) else 0.0
+            in_band = abs(self._last_peak_offset_hz) < AUDIO_CENTER_MAX_HZ
+            off = self._last_peak_offset_hz if (sig_snr >= 6.0 and in_band) else 0.0
             self.audio_player.set_tuning_offset(off)
+            # SQUELCH: kanalda gerçek sinyal (yeterli SNR) varsa aç, yoksa kapat -> gürültüde sessizlik.
+            self.audio_player.set_squelch_open(sig_snr >= self.audio_squelch_snr_db)
 
         # OLAY-TETİKLEMELİ AĞIR AMC: yalnızca sinyal eşiği aşılınca + periyot dolunca.
         # (Bant TARAMA sırasında kapalı: pencere hızla değişir, sınıflandırma anlamsız + CPU israfı.)
-        if self.use_hardware and not self.scan_active and sig_snr >= CLASSIFY_TRIGGER_DB:
+        if self.use_hardware and not self.scan_active and getattr(self, "_adc_clipping", False) and sig_snr >= CLASSIFY_TRIGGER_DB:
+            # SİNYAL KIRPIK (ADC doygun): AMC güvenilmez (dijital yapı yok olur, FM/FSK sanılır).
+            # Yanlış sınıflandırma göstermek yerine operatörü doğrudan yönlendir + konsolidatörü besleme.
+            self._last_valid_sig_time = now
+            self._clf_result = {"modulation": "⚠️ Sinyal KIRPIK (ADC doygun) — Gain/atenüasyon düşür",
+                                "confidence": 0.0, "multiplex": "-", "ekkt": "-", "protocol": "-"}
+        elif self.use_hardware and not self.scan_active and sig_snr >= CLASSIFY_TRIGGER_DB:
             self._last_valid_sig_time = now
             if (now - self._last_classify_time) >= CLASSIFY_PERIOD_SEC:
                 snap = self._get_classify_snapshot(iq1)
@@ -657,6 +694,18 @@ class SDRWorker(QThread):
                     "occupied_bw_hz": float(spectrum_info.get("occupied_bw_hz", 0.0) or 0.0),
                     "symbol_rate_hz": float(self._clf_result.get("symbol_rate_hz", 0.0) or 0.0),
                 }, now)
+                # TEŞHİS (sahada "dijital görünmüyor" sorunu): kararı + ham özellikleri + SNR + tepe
+                # genliği (kırpma) throttle'lı logla. sdp/kurt/c40 hangi dala gidildiğini gösterir;
+                # FM/FSK grubu ise refine 'reason' analog/sayısal kararının NEDENİNİ verir.
+                if (now - getattr(self, "_last_clsdiag_time", 0.0)) > 2.0:
+                    r = self._clf_result
+                    self.log_signal.emit(
+                        f"🔬 AMC: {r.get('modulation','?')} | SNR≈{r.get('snr_db','?')} dB | "
+                        f"tepe={getattr(self, '_dbg_peak_amp', 0.0):.2f} (>1.0=KIRPIK) | "
+                        f"sdp={r.get('sigma_dp','-')} kurt={r.get('if_kurt','-')} c40={r.get('c40','-')}"
+                        + (f" | refine={getattr(self, '_dbg_refine_reason', '')}"
+                           if "FSK" in r.get('modulation', '') or "FM (" in r.get('modulation', '') else ""))
+                    self._last_clsdiag_time = now
         elif self.use_hardware:
             # Sinyal eşik altına düştüğünde (örn. konuşma boşluğu/fading), yazının anında
             # "Sinyal yok" olarak değişip titremesini (flickering) önlemek için 3 saniyelik "Hold Time"
@@ -844,15 +893,19 @@ class SDRWorker(QThread):
         # UZAK DÜĞÜM (self olmayan) CANLI BAĞLANTI DURUMU — arayüzde ANT-2/ANT-3 yeşil/kırmızı için.
         # REGISTRY tabanlı: hiç veri göndermemiş bir düğüm bile listede olur (bağlı değil=kırmızı).
         # connected = kayıt VAR ve BAYAT DEĞİL (son stale_sec içinde JSON geldi).
+        live_ang = self.node_store.live_angles(now)     # {id: canlı enkoder açısı} (kerterizden bağımsız)
         remote_nodes = []
         for nid, cfg in self.df_registry.items():
             if cfg.get("self"):
                 continue
             rec = raw_snap.get(nid)
+            # BAĞLI: taze kerteriz VEYA taze canlı-açı paketi geldiyse (aux tepe bulmadan da canlıdır)
+            connected = bool((rec is not None and not rec.get("stale", True)) or (nid in live_ang))
             remote_nodes.append({
                 "id": nid,
-                "connected": bool(rec is not None and not rec.get("stale", True)),
+                "connected": connected,
                 "age_sec": (rec.get("age_sec") if rec is not None else None),
+                "live_angle_deg": live_ang.get(nid),
             })
 
         # HAREKETLİ TEK ALICI (5.1.5): biriken (GPS konumu, kerteriz) örneklerinden ayrı bir konum
@@ -877,6 +930,7 @@ class SDRWorker(QThread):
             "dimensionality": ("3B" if abs(float(pos[2])) > 1e-6 else "2B (yer izdüşümü)"),
             "nodes": snap,
             "remote_nodes": remote_nodes,     # uzak düğüm canlı bağlantı durumu (ANT-2/3 yeşil/kırmızı)
+            "node_live_angles": tuple(live_ang.get(nid) for nid in list(self.df_registry.keys())[:3]),
             "active_count": len(positions),
             "target_bearing_deg": tgt_az,
             "target_range_m": tgt_range,
@@ -911,6 +965,7 @@ class SDRWorker(QThread):
             if len(disc) < 512:
                 return
             r = classify_fm_or_fsk(disc, self._refine_demod.out_rate)
+            self._dbg_refine_reason = r.get("reason", "")   # teşhis log'u için (analog/sayısal nedeni)
             if r.get("is_digital") is True:
                 baud = r.get("symbol_rate_hz", 0.0)
                 self._clf_result["modulation"] = (f"FSK/C4FM (Sayısal-Frekans, ~{baud:.0f} baud)"
@@ -1203,6 +1258,7 @@ class SDRWorker(QThread):
         self.scan_step_mhz = max(0.5, self.bandwidth_mhz * 0.9)   # pencereler örtüşecek şekilde adım
         self.scan_cursor_mhz = lo
         self.scan_detections = {}
+        self._scan_candidates = {}      # onaylanmamış adaylar: key -> {..., hits, first_ts, last_ts}
         self._nf_trackers = {}          # tarihsel-min gürültü tabanları sıfırlanır
         self.set_frequency(lo, quiet=True)
         self._scan_settle_until = time.time() + SCAN_SETTLE_SEC
@@ -1210,6 +1266,14 @@ class SDRWorker(QThread):
         self.log_signal.emit(
             f"🔍 BANT TARAMA BAŞLADI: {lo:.1f}–{hi:.1f} MHz (adım {self.scan_step_mhz:.1f} MHz, "
             f"eşik gürültü+{SCAN_DETECT_DB:.0f} dB)")
+
+    def set_scan_sensitivity(self, prominence_db: float):
+        """Tarama hassasiyeti (CFAR yerel-belirginlik eşiği, dB). DÜŞÜK = daha hassas (zayıf sinyali
+        de yakalar, gürültü artabilir); YÜKSEK = daha seçici (sadece net sinyaller, temiz liste).
+        Arayüzdeki sürgü bunu çağırır. Makul aralık ~6–22 dB; varsayılan SCAN_PROMINENCE_DB."""
+        self.scan_prominence_db = float(np.clip(prominence_db, 3.0, 30.0))
+        self.log_signal.emit(f"Backend: Tarama hassasiyeti -> yerel-belirginlik ≥ {self.scan_prominence_db:.0f} dB "
+                             f"({'seçici' if self.scan_prominence_db >= 15 else 'hassas' if self.scan_prominence_db <= 9 else 'dengeli'}).")
 
     def stop_scan_rf(self):
         self.scan_active = False
@@ -1232,26 +1296,54 @@ class SDRWorker(QThread):
             ckey = round(self.center_freq_mhz * 10)
             tracker = self._nf_trackers.setdefault(ckey, NoiseFloorTracker())
             nf = tracker.update(fft)
-            # ADA/ENERJİ tespiti — dar + geniş bant birlikte, bant genişliğiyle (uzman #2)
+            # ADA/ENERJİ tespiti — dar + geniş bant birlikte, bant genişliğiyle (uzman #2).
+            # DC_GUARD: pencere merkezindeki dar DC/LO sızıntı tepesini eler (B200 offset, her retune'da).
+            # CLOSE_GAP: dalgalı geniş sinyal tek tespit olsun (çok parçaya bölünmesin).
+            bin_hz = (self.bandwidth_mhz * 1e6) / max(1, len(fft))
+            close_gap = int(SCAN_CLOSE_GAP_HZ / bin_hz) if bin_hz > 0 else 0
             for freq, pwr, snr, bw in self.dsp.detect_signals(
-                    fft, nf, self.center_freq_mhz, self.bandwidth_mhz, SCAN_DETECT_DB):
+                    fft, nf, self.center_freq_mhz, self.bandwidth_mhz, SCAN_DETECT_DB,
+                    dc_guard_bins=SCAN_DC_GUARD_BINS, close_gap_bins=close_gap,
+                    prominence_db=self.scan_prominence_db):
                 key = round(freq / SCAN_MERGE_MHZ)
                 prev = self.scan_detections.get(key)
-                if prev is None:
-                    # first_ts = İLK GÖRÜLME anı (ts ise son görülme). Sıralı yayında kaynakların
-                    # hangi SIRAYLA açıldığını arayüzde göstermek için kalıcı olarak saklanır.
-                    self.scan_detections[key] = {"freq_mhz": freq, "power_dbfs": pwr,
-                                                 "snr_db": snr, "bw_mhz": bw, "ts": now,
-                                                 "first_ts": now, "count": 1}
-                    bw_str = f", BG ~{bw*1000:.0f} kHz" if bw < 1.0 else f", BG ~{bw:.1f} MHz"
-                    self.log_signal.emit(f"📡 TESPİT: {freq:.3f} MHz @ {pwr:.0f} dBFS (SNR {snr:.0f} dB{bw_str})")
-                    self.logger.log_detection(freq, pwr, snr)
-                else:
+                if prev is not None:
+                    # ZATEN ONAYLI -> Max-Hold ile güncelle (sıralı-yayın senaryosunda kalıcı kalır).
                     prev["count"] += 1
                     prev["ts"] = now
-                    if pwr > prev["power_dbfs"]:                 # MAX-HOLD: daha güçlü ölçümle güncelle
+                    if pwr > prev["power_dbfs"]:
                         prev.update(freq_mhz=freq, power_dbfs=pwr, snr_db=snr, bw_mhz=bw)
-            if len(self.scan_detections) > SCAN_MAX_DETECTIONS:  # en zayıfı at
+                    continue
+                # HENÜZ ONAYSIZ -> aday havuzunda biriktir. Tek-karelik gürültü sıçraması rastgele
+                # bin'de olur; aynı frekansta SCAN_CONFIRM_HITS ayrı turda tekrar GELMEDİKÇE listeye
+                # girmez -> yalancı-pozitif seli önlenir.
+                cand = self._scan_candidates.get(key)
+                if cand is None:
+                    self._scan_candidates[key] = {"freq_mhz": freq, "power_dbfs": pwr, "snr_db": snr,
+                                                  "bw_mhz": bw, "first_ts": now, "last_ts": now, "hits": 1}
+                else:
+                    cand["hits"] += 1
+                    cand["last_ts"] = now
+                    if pwr > cand["power_dbfs"]:                 # aday da Max-Hold ile güçlensin
+                        cand.update(freq_mhz=freq, power_dbfs=pwr, snr_db=snr, bw_mhz=bw)
+                    if cand["hits"] >= SCAN_CONFIRM_HITS:        # ONAYLANDI -> listeye + loga TEK sefer
+                        self.scan_detections[key] = {
+                            "freq_mhz": cand["freq_mhz"], "power_dbfs": cand["power_dbfs"],
+                            "snr_db": cand["snr_db"], "bw_mhz": cand["bw_mhz"], "ts": now,
+                            "first_ts": cand["first_ts"], "count": cand["hits"]}
+                        del self._scan_candidates[key]
+                        cbw, cf = cand["bw_mhz"], cand["freq_mhz"]
+                        bw_str = f", BG ~{cbw*1000:.0f} kHz" if cbw < 1.0 else f", BG ~{cbw:.1f} MHz"
+                        self.log_signal.emit(f"📡 TESPİT: {cf:.3f} MHz @ {cand['power_dbfs']:.0f} dBFS "
+                                             f"(SNR {cand['snr_db']:.0f} dB{bw_str})")
+                        self.logger.log_detection(cf, cand["power_dbfs"], cand["snr_db"])
+            # Yeniden görülmeyen (onaylanmamış) adayları düşür -> gezici gürültü birikmez.
+            if self._scan_candidates:
+                stale = [k for k, c in self._scan_candidates.items()
+                         if now - c["last_ts"] > SCAN_CANDIDATE_TTL_SEC]
+                for k in stale:
+                    del self._scan_candidates[k]
+            while len(self.scan_detections) > SCAN_MAX_DETECTIONS:  # cap: en zayıfları toptan buda
                 weakest = min(self.scan_detections, key=lambda k: self.scan_detections[k]["power_dbfs"])
                 del self.scan_detections[weakest]
 
@@ -1261,6 +1353,30 @@ class SDRWorker(QThread):
             self.scan_cursor_mhz = self.scan_start_mhz
         self.set_frequency(self.scan_cursor_mhz, quiet=True)
         self._scan_settle_until = now + SCAN_SETTLE_SEC
+
+    def _scan_detections_view(self):
+        """Onaylı tespitleri arayüz/CSV için TEMİZLER: baskın bir taşıyıcının derin 'omuz/etek'
+        gölgesindeki zayıf tespitler AYRI sinyal sayılmaz (tek güçlü sinyal düzinelerce sahte komşu
+        üretmesin). NOT: Bu yalnızca GÖRÜNÜM temizliğidir; ADC doygunluğunun ürettiği geniş-bant
+        spur'ları GİDERMEZ -> onun tek çözümü GAIN'i düşürmektir. Dönüş: freq'e göre sıralı liste."""
+        dets = list(self.scan_detections.values())
+        strong_first = sorted(dets, key=lambda d: -d["power_dbfs"])
+        kept = []
+        for d in strong_first:
+            shadowed = False
+            for s in kept:
+                span = max(SCAN_SHOULDER_MIN_MHZ, s.get("bw_mhz", 0.0) * SCAN_SHOULDER_SPAN_MULT)
+                if abs(d["freq_mhz"] - s["freq_mhz"]) <= span \
+                        and (s["power_dbfs"] - d["power_dbfs"]) >= SCAN_SHOULDER_DB:
+                    shadowed = True
+                    break
+            if not shadowed:
+                kept.append(d)
+        return sorted(
+            ({"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
+              "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0),
+              "first_ts": d.get("first_ts", d.get("ts", 0.0))} for d in kept),
+            key=lambda x: x["freq_mhz"])
 
     def set_gain(self, gain_db: float):
         self.gain_db = float(gain_db)
@@ -1467,6 +1583,14 @@ class SDRWorker(QThread):
         if self.audio_player is not None:
             self.audio_player.set_mode(self.audio_mode)
 
+    def set_squelch_snr_db(self, snr_db: float):
+        """Ses SQUELCH eşiği (dB SNR). DÜŞÜK = daha çok açık (zayıf sesi de duyar, cızırtı artabilir);
+        YÜKSEK = daha çok kapalı (sadece net sinyalde ses, sessizlik daha fazla). 0 = squelch KAPALI
+        (her şeyi duy). Makul aralık ~0–20 dB."""
+        self.audio_squelch_snr_db = float(np.clip(snr_db, 0.0, 40.0))
+        self.log_signal.emit(f"Backend: Ses squelch eşiği -> {self.audio_squelch_snr_db:.0f} dB "
+                             f"({'kapalı (hepsini duy)' if self.audio_squelch_snr_db <= 0 else 'açık'}).")
+
     def set_audio_listen(self, listen: bool) -> bool:
         """Dinle/Sustur. Dinle: oynatıcıyı başlat + sesi aç. Döner: gerçekten dinleniyor mu."""
         if listen:
@@ -1571,7 +1695,9 @@ class SDRWorker(QThread):
                     data, _addr = self.udp_socket.recvfrom(2048)
                     msg = json.loads(data.decode("utf-8"))
                     if self.node_store.update_from_json(msg):
-                        pass  # kabul edildi (otonom işlendi)
+                        # SOHBET için: bu düğümün IP'sini öğren (chat mesajlarını buraya yollarız)
+                        if msg.get("id"):
+                            self._chat_peers[str(msg["id"])] = _addr[0]
                 except socket.timeout:
                     continue
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1583,6 +1709,59 @@ class SDRWorker(QThread):
         finally:
             if self.udp_socket:
                 self.udp_socket.close()
+
+    # ------------------------------------------------------------------ SOHBET (aux <-> merkez)
+    def _chat_listener_loop(self):
+        """SOHBET dinleyici (UDP 5006). Gelen mesajı arayüze iletir VE hub olarak diğer düğümlere dağıtır."""
+        self.chat_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.chat_socket.bind(("0.0.0.0", self.CHAT_PORT))
+            self.chat_socket.settimeout(1.0)
+            while self._is_running:
+                try:
+                    data, addr = self.chat_socket.recvfrom(4096)
+                    msg = json.loads(data.decode("utf-8"))
+                    if msg.get("type") != "chat" or "text" not in msg:
+                        continue
+                    frm = str(msg.get("from", "?"))
+                    if frm and frm != "MERKEZ":
+                        self._chat_peers[frm] = addr[0]        # yanıt için IP öğren
+                    self.chat_signal.emit({"from": frm, "text": str(msg["text"])[:500],
+                                           "ts": float(msg.get("ts", time.time()))})
+                    self._relay_chat(msg, exclude_ip=addr[0])  # HUB: diğer düğümlere dağıt
+                except socket.timeout:
+                    continue
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+                    continue
+                except OSError:
+                    break
+        except OSError as e:
+            self.log_signal.emit(f"Backend: Sohbet dinleyici başlatılamadı ({e})")
+        finally:
+            if self.chat_socket:
+                self.chat_socket.close()
+
+    def _relay_chat(self, msg, exclude_ip=None):
+        """Sohbet mesajını bilinen tüm düğümlere (exclude_ip hariç) yolla."""
+        if self.chat_socket is None:
+            return
+        raw = json.dumps(msg).encode("utf-8")
+        for nid, ip in list(self._chat_peers.items()):
+            if ip == exclude_ip:
+                continue
+            try:
+                self.chat_socket.sendto(raw, (ip, self.CHAT_PORT))
+            except OSError:
+                pass
+
+    def send_chat(self, text: str):
+        """Merkezden sohbet mesajı gönder (tüm aux'lara) + arayüzde kendi mesajını göster."""
+        text = str(text).strip()[:500]
+        if not text:
+            return
+        msg = {"type": "chat", "from": "MERKEZ", "text": text, "ts": time.time()}
+        self.chat_signal.emit({"from": "MERKEZ", "text": text, "ts": msg["ts"]})
+        self._relay_chat(msg, exclude_ip=None)
 
     def run(self):
         self._is_running = True
@@ -1597,6 +1776,9 @@ class SDRWorker(QThread):
         # Ağ Dinleyicisini Başlat
         self.udp_thread = threading.Thread(target=self._udp_listener_loop, daemon=True)
         self.udp_thread.start()
+        # Sohbet Dinleyicisini Başlat (aux <-> merkez, UDP 5006)
+        self.chat_thread = threading.Thread(target=self._chat_listener_loop, daemon=True)
+        self.chat_thread.start()
         
         # C++ SDR Motorunu başlat
         if self.use_hardware and hasattr(self, 'engine'):
@@ -1633,6 +1815,11 @@ class SDRWorker(QThread):
                     # üreterek TÜM bandı gürültüyle doldurur (spektrum "çim" görünür, tümsek kaybolur).
                     # Bunu sessizce geçmek yerine operatörü uyarıp gain düşürmeye yönlendiriyoruz.
                     peak_amp = float(np.max(np.abs(iq1))) if iq1.size else 0.0
+                    # KIRPMA BAYRAĞI: sınıflandırma bunu okur. Kırpık sinyalde zarf ±tam-skalaya railed
+                    # olur -> dijital (PSK/QAM) yapı yok olup FM/FSK'ye benzer (sahte). Bu yüzden kırpıkken
+                    # AMC sonucunu göstermek yerine "gain düşür" uyarısı basılır (yanlış sayısal/analog kararı yok).
+                    self._adc_clipping = bool(peak_amp >= 0.98)
+                    self._dbg_peak_amp = peak_amp        # AMC teşhis log'u için (sahada dijital ayrımı)
                     if peak_amp >= 0.98 and (time.time() - getattr(self, '_last_sat_warn', 0.0)) > 2.0:
                         self.log_signal.emit(
                             f"⚠️ ADC DOYGUNLUĞU! Tepe genlik={peak_amp:.2f} (>1.0 = kırpma). "
@@ -1717,7 +1904,9 @@ class SDRWorker(QThread):
                 # "FM/FSK" (henüz ses-kesinleştirmesi olmayan grup) -> "belirleniyor" (dürüst, sahte değil).
                 mod_str = self._clf_result.get("modulation", "")
                 ad = self._clf_result.get("analog_digital")   # _refine_fm_fsk kesinleştirdiyse dolu
-                if any(s in mod_str for s in ("Sinyal yok", "Belirlenemedi", "Ölçülüyor")):
+                if "KIRPIK" in mod_str:
+                    ana_dig_tag = " (KIRPIK — güç düşür, sınıflandırılamaz)"
+                elif any(s in mod_str for s in ("Sinyal yok", "Belirlenemedi", "Ölçülüyor")):
                     ana_dig_tag = " (Sınıflandırılıyor...)"
                 elif "FM/FSK" in mod_str:                      # henüz ses-kesinleştirmesi yok (grup)
                     ana_dig_tag = " (Analog/Sayısal: sesle belirleniyor)"
@@ -1735,6 +1924,7 @@ class SDRWorker(QThread):
                     "fft_dbm": fft_dbm,
                     "audio_y": audio_y,
                     "angles": (ang1_deg, ang2_deg, ang3_deg),
+                    "node_live_angles": df.get("node_live_angles"),   # aux canlı anten açısı (anlık)
                     "amps": (amp1, amp2, amp3),
                     "target_pos": (target_x, target_y),
                     "freq_bounds": (start_freq, end_freq),
@@ -1761,12 +1951,8 @@ class SDRWorker(QThread):
                     "power_cal_offset_db": self.dsp.cal_offset_db,
                     # RF bant tarama / sinyal tespiti (5.1.1) — tespit edilen sinyaller (frekans+güç+SNR)
                     "scan_active": self.scan_active,
-                    "scan_detections": sorted(
-                        ({"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
-                          "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0),
-                          "first_ts": d.get("first_ts", d.get("ts", 0.0))}   # ilk görülme (5.1.1 sıra kanıtı)
-                         for d in self.scan_detections.values()),
-                        key=lambda x: x["freq_mhz"]),
+                    # Omuz/etek bastırılmış TEMİZ görünüm (ilk görülme = 5.1.1 sıra kanıtı korunur)
+                    "scan_detections": self._scan_detections_view(),
                     "tx_active": self.tx_active,
                     "tx_mode": self.tx_params["mode"] if self.tx_active else "NONE",
                     # Arabakış (5.2.2) kapalı-çevrim durumu: karıştırma aktif mi yoksa (yayın sonlandı)

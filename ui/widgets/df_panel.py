@@ -83,12 +83,20 @@ class DFPanel(QWidget):
         dev1_layout.addWidget(self.lbl_dev1_ang)
         dev1_layout.addWidget(self.spin_dev1)
         
+        # AUX CANLI anten açısı (anlık, ağdan) — SDR-2/3 satırında kerterizin YANINDA.
+        self.lbl_dev2_live = QLabel("")
+        self.lbl_dev3_live = QLabel("")
+        for lbl in (self.lbl_dev2_live, self.lbl_dev3_live):
+            lbl.setStyleSheet("font-size: 13px; color: #00e5ff;")
+
         dev2_layout = QHBoxLayout()
         dev2_layout.addWidget(self.lbl_dev2_ang)
+        dev2_layout.addWidget(self.lbl_dev2_live)
         dev2_layout.addWidget(self.spin_dev2)
-        
+
         dev3_layout = QHBoxLayout()
         dev3_layout.addWidget(self.lbl_dev3_ang)
+        dev3_layout.addWidget(self.lbl_dev3_live)
         dev3_layout.addWidget(self.spin_dev3)
 
         for lbl in [self.lbl_dev1_ang, self.lbl_dev2_ang, self.lbl_dev3_ang]:
@@ -183,9 +191,9 @@ class DFPanel(QWidget):
         self.lbl_df_rms.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffb74d;")
         layout_df.addWidget(self.lbl_df_rms)
         layout.addWidget(self.box_df_accuracy, stretch=1)
-        
-        # Panellerin genişliğini yarıya düşürüp sola dayamak için:
-        layout.addStretch(3)
+
+        # NOT: Eski addStretch(3) (sağdaki boşluk) KALDIRILDI — o boşluğu artık SAHA SOHBETİ paneli
+        # dolduruyor (main_window kalibrasyonun sağına ekler, geniş stretch ile sola doğru uzanır).
 
     def on_apply_positions(self):
         """Yardımcı düğüm konumlarını (mesafe + pusula açısı) topla ve yayınla. Ana cihaz (0,0) sabittir."""
@@ -237,3 +245,11 @@ class DFPanel(QWidget):
             self.lbl_live_angle.setText("CANLI ANTEN AÇISI: --°  (enkoder yok)")
         else:
             self.lbl_live_angle.setText(f"CANLI ANTEN AÇISI: {deg:.1f}°")
+
+    def update_node_live_angles(self, live_list):
+        """Aux (NODE-2/3) CANLI anten açısını SDR-2/3 satırında göster (anlık, ağdan).
+        live_list = [node0, node1, node2] (derece | None). node0=merkez (kendi enkoderi, üstte)."""
+        live_list = list(live_list or [])
+        for i, lbl in ((1, self.lbl_dev2_live), (2, self.lbl_dev3_live)):
+            v = live_list[i] if i < len(live_list) else None
+            lbl.setText(f"⟳ canlı {v:.0f}°" if isinstance(v, (int, float)) else "")

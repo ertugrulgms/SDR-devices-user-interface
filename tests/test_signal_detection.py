@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import QApplication
 _app = QApplication.instance() or QApplication(sys.argv)
 
 from backend.dsp_processor import DSPProcessor
-from backend.sdr_worker import SDRWorker
+from backend.sdr_worker import SDRWorker, SCAN_CONFIRM_HITS
 from backend.mission_logger import MissionLogger, _DATA_DIR
 
 
@@ -101,18 +101,39 @@ class TestScannerStateMachine(unittest.TestCase):
 
     def test_scan_detects_and_advances(self):
         self.w.set_bandwidth(20.0)
-        self.w.start_scan_rf(400.0, 2500.0)
-        self.w._scan_settle_until = 0.0                      # oturmayı atla
+        self.w.start_scan_rf(400.0, 400.0)                   # tek frekans -> revisit aynı merkez
         # Gerçekçi bir sinyal adası (çok bin geniş) simüle et
         fft = np.full(2048, -80.0); fft[1000:1030] = -30.0   # ~30 bin genişliğinde ada
-        self.w._last_raw_fft = fft
-        start_freq = self.w.center_freq_mhz
-        self.w._service_scan()
-        self.assertGreater(len(self.w.scan_detections), 0)   # tespit kaydedildi
-        self.assertGreater(self.w.center_freq_mhz, start_freq)  # sonraki frekansa geçti
+        # ONAY: aynı frekansta SCAN_CONFIRM_HITS tur görülünce listeye girer (tek-kare gürültü elenir)
+        for _ in range(SCAN_CONFIRM_HITS):
+            self.w.scan_cursor_mhz = 400.0
+            self.w._scan_settle_until = 0.0                  # oturmayı atla
+            self.w._last_raw_fft = fft
+            self.w._service_scan()
+        self.assertGreater(len(self.w.scan_detections), 0)   # onaylı tespit kaydedildi
         # Tespit bant genişliği taşıyor (dar+geniş bant motoru)
         det = list(self.w.scan_detections.values())[0]
         self.assertIn("bw_mhz", det)
+
+    def test_scan_advances_cursor(self):
+        # Tarama, her adımda bir sonraki merkez frekansa geçmeli (süpürme).
+        self.w.set_bandwidth(20.0)
+        self.w.start_scan_rf(400.0, 2500.0)
+        self.w._scan_settle_until = 0.0
+        self.w._last_raw_fft = np.full(2048, -80.0)          # sinyal gerekmez, sadece ilerleme
+        start_freq = self.w.center_freq_mhz
+        self.w._service_scan()
+        self.assertGreater(self.w.center_freq_mhz, start_freq)  # sonraki frekansa geçti
+
+    def test_single_frame_spike_not_confirmed(self):
+        # YALANCI-POZİTİF ELEME: tek bir karede görülen tepe (gezici gürültü) ASLA listeye girmez.
+        self.w.set_bandwidth(20.0)
+        self.w.start_scan_rf(400.0, 2500.0)
+        self.w._scan_settle_until = 0.0
+        fft = np.full(2048, -80.0); fft[1000:1030] = -30.0
+        self.w._last_raw_fft = fft
+        self.w._service_scan()                               # yalnızca 1 tur görüldü
+        self.assertEqual(len(self.w.scan_detections), 0)     # onaylanmadı -> listede yok
 
     def test_scan_no_self_masking_wideband(self):
         # SELF-MASKING (uzman #1): band önce boş, sonra TÜM pencereyi kaplayan dev sinyal gelir;
@@ -120,12 +141,14 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.set_bandwidth(20.0)
         self.w.start_scan_rf(400.0, 400.0)                   # tek frekans (revisit aynı merkez)
         self.w._scan_settle_until = 0.0
-        self.w._last_raw_fft = np.full(2048, -80.0)          # 1) boş band
+        self.w._last_raw_fft = np.full(2048, -80.0)          # 1) boş band -> düşük taban öğrenilir
         self.w._service_scan()
-        self.w.scan_cursor_mhz = 400.0                       # aynı merkeze dön
-        self.w._scan_settle_until = 0.0
-        self.w._last_raw_fft = np.full(2048, -35.0)          # 2) dev geniş-bant sinyal (band %100 dolu)
-        self.w._service_scan()
+        # 2) dev geniş-bant sinyal (band %100 dolu); onay için CONFIRM tur besle
+        for _ in range(SCAN_CONFIRM_HITS):
+            self.w.scan_cursor_mhz = 400.0                   # aynı merkeze dön
+            self.w._scan_settle_until = 0.0
+            self.w._last_raw_fft = np.full(2048, -35.0)
+            self.w._service_scan()
         self.assertGreater(len(self.w.scan_detections), 0)   # medyan körlenirdi; tarihsel-min yakaladı
 
     def test_scan_no_signal_no_detection(self):
@@ -140,6 +163,43 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.start_scan_rf(400.0, 2500.0)
         self.w.stop_scan_rf()
         self.assertFalse(self.w.scan_active)
+
+
+class TestCFARProminence(unittest.TestCase):
+    """CFAR yerel-belirginlik: güçlü taşıyıcının yükselttiği DÜZ gürültü tabanı yalancı tespit
+    üretmemeli (gerçek dış sinyal yokken), gerçek TEPE korunmalı."""
+
+    def setUp(self):
+        self.d = DSPProcessor(fft_size=2048)
+
+    def test_flat_raised_floor_rejected(self):
+        # Güçlü taşıyıcının desense ettiği DÜZ dalgalı taban (-40 ort). Tarihsel-min ~-53'te takılı.
+        # Gerçek sinyal YOK -> CFAR ile tespit sayısı çok düşük olmalı (eski davranış yüzlerce üretirdi).
+        rng = np.random.default_rng(7)
+        carpet = -40.0 + rng.standard_normal(2048) * 4.0
+        nf = np.full(2048, -53.0)
+        old = self.d.detect_signals(carpet, nf, 1260.0, 10.0, 10.0, prominence_db=0.0)
+        new = self.d.detect_signals(carpet, nf, 1260.0, 10.0, 10.0, prominence_db=12.0)
+        self.assertGreater(len(old), 50)      # CFAR'sız: düz taban yüzlerce hayalet
+        self.assertLessEqual(len(new), 3)      # CFAR'lı: düz taban elenir (hayalet ~0)
+
+    def test_real_peak_survives_cfar(self):
+        # Çevresi düşük gürültü (-70), tek gerçek TEPE (+20) -> CFAR onu KORUMALI.
+        rng = np.random.default_rng(3)
+        fft = np.full(2048, -70.0) + rng.standard_normal(2048) * 1.0
+        fft[600:604] = 20.0
+        nf = np.full(2048, -73.0)
+        r = self.d.detect_signals(fft, nf, 1260.0, 10.0, 10.0, prominence_db=12.0)
+        self.assertGreaterEqual(len(r), 1)     # gerçek tepe korunur
+        self.assertTrue(any(abs(f - (1260.0 + (602 - 1024) / 2048 * 10.0)) < 0.05 for f, *_ in r))
+
+    def test_wide_signal_bypasses_cfar(self):
+        # Pencereyi dolduran GENİŞ sinyal (self-masking): yerel taban güvenilmez -> CFAR atlanmalı,
+        # tarihsel-min sayesinde yine tespit edilmeli.
+        fft = np.full(2048, -35.0)             # tüm pencere dolu (geniş sinyal)
+        nf = np.full(2048, -80.0)              # tarihsel-min düşük taban hatırlıyor
+        r = self.d.detect_signals(fft, nf, 1260.0, 10.0, 10.0, prominence_db=12.0)
+        self.assertGreaterEqual(len(r), 1)     # geniş sinyal CFAR'a rağmen yakalanır
 
 
 class TestDetectionLogging(unittest.TestCase):

@@ -73,7 +73,8 @@ except Exception:
     _HAVE_SERIAL = False
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QDoubleSpinBox, QPushButton, QTextEdit, QGridLayout, QCheckBox)
+                             QLabel, QDoubleSpinBox, QPushButton, QTextEdit, QGridLayout, QCheckBox,
+                             QLineEdit, QGroupBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import pyqtgraph as pg
 
@@ -187,13 +188,19 @@ class EncoderReader:
     def _loop(self):
         while self._running and self.connected:
             try:
-                if self.conn.in_waiting > 0:
+                # TAMPONU BOŞALT: biriken TÜM satırları oku, yalnızca EN SON ANGLE'ı kullan. Eskiden
+                # her turda tek satır okunuyordu; firmware okuyandan hızlı yollarsa seri tampon birikip
+                # açı 10-15 sn GERİDEN gelirdi. Boşaltınca raw_angle daima güncel kalır (gecikme ~0).
+                latest = None
+                while self.conn.in_waiting > 0:
                     line = self.conn.readline().decode("utf-8", errors="ignore").strip()
                     if line.startswith("ANGLE:"):
-                        try:
-                            self.raw_angle = float(line.split(":")[1])
-                        except ValueError:
-                            pass
+                        latest = line
+                if latest is not None:
+                    try:
+                        self.raw_angle = float(latest.split(":")[1])
+                    except (ValueError, IndexError):
+                        pass
             except Exception:
                 self.connected = False
                 break
@@ -440,13 +447,25 @@ class AuxWorker(QThread):
                     time.sleep(0.02)
                     continue
 
-            # 2) Spektrum (dBm) + hedef gücü
+            # 2) Spektrum (dBm) + HEDEF gücü
             n = len(iq)
             w = win if n == FFT_POINTS else np.hanning(n)
             fc = np.fft.fftshift(np.fft.fft((iq - np.mean(iq)) * w, n=FFT_POINTS))
             fft_dbm = 10.0 * np.log10(np.abs(fc) ** 2 / FFT_POINTS + 1e-12) + self.cal_offset_db
-            # Alınan güç = spektrum tepesi (hedef sinyalin gücü; anten yönüyle değişir)
-            peak_dbm = float(np.max(fft_dbm))
+            # HEDEF gücü: MERKEZ ±80 kHz'te DC-HARİÇ en güçlü tepe. Global tepe DEĞİL (uzak bir
+            # interferer'a kilitlenip kerteriz bir bölgede TAKILMASIN — E-S arası sabit kalma sorunu);
+            # tam DC de DEĞİL (DC dikeni + mean-removal gücü düşürür -> yanlış ~20 dBm). Hedef, tune
+            # edilen merkeze yakındır; onun AÇISAL tepkisi ölçülür -> anten dönünce güç gerçekten değişir
+            # -> kerteriz kaynağın yönüne oturur ve orada kalır. Tepe ±2 bin entegre (tek-bin gürültüsü).
+            c = FFT_POINTS // 2
+            bin_hz = (self.cfg["rate"] * 1e6) / FFT_POINTS
+            wbin = int(np.clip(80e3 / bin_hz, 8, FFT_POINTS // 4))
+            band = np.array(fft_dbm[c - wbin:c + wbin + 1], dtype=float)
+            band[wbin - 2:wbin + 3] = -300.0                   # DC ±2 bin bastır (LO dikeni)
+            pk = int(np.argmax(band))
+            lo_i, hi_i = max(0, pk - 2), min(len(band), pk + 3)
+            seg = np.power(10.0, band[lo_i:hi_i] / 10.0)
+            peak_dbm = float(10.0 * np.log10(np.mean(seg) + 1e-12))
             noise = float(np.median(fft_dbm))
             snr_db = peak_dbm - noise
 
@@ -464,20 +483,24 @@ class AuxWorker(QThread):
                 self._last_bearing = (bearing, bpk, conf, ncnt)
             tx = self._last_bearing
 
-            # 4) Merkeze kerteriz gönder (JSON/UDP) — hız sınırlı
+            # 4) Merkeze gönder (JSON/UDP) — CANLI AÇI HER ZAMAN (kerteriz olmasa da), hız sınırlı.
+            #    Böylece ana cihaz aux antenin O ANKİ yönünü ~100 ms'de görür — kerterizin 15 sn'lik
+            #    ortalamasını BEKLEMEZ (canlı açı gecikmesi bu yüzden vardı). azimuth_deg (kerteriz)
+            #    yalnızca VARSA eklenir (füzyon/üçgenleme için); yoksa paket yine gider (düğüm canlı kalır).
             sent = False
             now = time.time()
             _rate_hz = self.cfg.get("rate_hz") or 10.0     # None/eksikse güvenli varsayılan (çökme yok)
-            if self.sending and tx is not None and (now - self._last_send) >= (1.0 / _rate_hz):
-                _b_az, _b_pk = tx[0], tx[1]
+            if self.sending and (now - self._last_send) >= (1.0 / _rate_hz):
                 msg = {
                     "id": self.cfg["id"],
-                    "azimuth_deg": round(_b_az, 2),
-                    "elevation_deg": 0.0,
-                    "amp_dbm": round(_b_pk, 1),
+                    "live_angle_deg": round(az, 1),        # CANLI enkoder açısı (antenin anlık yönü)
+                    "amp_dbm": round(peak_dbm, 1),
                     "snr_db": round(snr_db, 1),
                     "freq_mhz": round(self.freq_hz / 1e6, 4),
                 }
+                if tx is not None:                          # kerteriz bulunduysa ekle
+                    msg["azimuth_deg"] = round(tx[0], 2)
+                    msg["elevation_deg"] = 0.0
                 try:
                     self.sock.sendto(json.dumps(msg).encode("utf-8"), (self.cfg["host"], self.cfg["port"]))
                     sent = True
@@ -507,6 +530,46 @@ class AuxWorker(QThread):
 # ----------------------------------------------------------------------------- #
 #  ARAYÜZ (sadece: RF · Spektrum · Açı · dBm  + kerteriz/durum)
 # ----------------------------------------------------------------------------- #
+class ChatListener(QThread):
+    """SAHA SOHBETİ dinleyici (UDP 5006). Merkez hub'dan gelen mesajları arayüze iletir."""
+    received = pyqtSignal(dict)
+
+    def __init__(self, port=5006):
+        super().__init__()
+        self.port = port
+        self._running = False
+        self.sock = None
+
+    def run(self):
+        self._running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("0.0.0.0", self.port))
+            self.sock.settimeout(1.0)
+            while self._running:
+                try:
+                    data, _addr = self.sock.recvfrom(4096)
+                    msg = json.loads(data.decode("utf-8"))
+                    if msg.get("type") == "chat" and "text" in msg:
+                        self.received.emit({"from": str(msg.get("from", "?")),
+                                            "text": str(msg["text"])[:500],
+                                            "ts": float(msg.get("ts", time.time()))})
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
+        except OSError:
+            pass
+        finally:
+            if self.sock:
+                self.sock.close()
+
+    def stop(self):
+        self._running = False
+        self.wait(1500)
+
+
 class AuxWindow(QMainWindow):
     def __init__(self, cfg):
         super().__init__()
@@ -581,11 +644,41 @@ class AuxWindow(QMainWindow):
         self.curve = self.plot.plot(pen=pg.mkPen("#00e676", width=1))
         root.addWidget(self.plot, stretch=3)
 
-        # --- Log ---
+        # --- Log + SAHA SOHBETİ (yan yana; sohbet boş alana yerleşir) ---
+        bottom = QHBoxLayout()
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(120)
-        root.addWidget(self.log, stretch=1)
+        self.log.setMaximumHeight(140)
+        bottom.addWidget(self.log, stretch=1)
+
+        chat_box = QGroupBox("SAHA SOHBETİ (Merkez ↔ Aux)")
+        chat_box.setStyleSheet("QGroupBox{border:2px solid #333;border-radius:8px;margin-top:8px;"
+                               "font-size:14px;font-weight:bold;color:#00e5ff;}"
+                               "QGroupBox::title{subcontrol-origin:margin;subcontrol-position:top center;padding:0 5px;}")
+        cv = QVBoxLayout(chat_box)
+        self.chat_log = QTextEdit()
+        self.chat_log.setReadOnly(True)
+        self.chat_log.setStyleSheet("background:#141414;color:#e0e0e0;font-family:monospace;font-size:12px;")
+        cv.addWidget(self.chat_log, stretch=1)
+        crow = QHBoxLayout()
+        self.chat_inp = QLineEdit()
+        self.chat_inp.setPlaceholderText("Merkeze mesaj… (Enter)")
+        self.chat_inp.setStyleSheet("background:#2a2a2a;color:#fff;padding:6px;border:1px solid #555;")
+        self.chat_inp.returnPressed.connect(self._send_chat)
+        crow.addWidget(self.chat_inp, stretch=1)
+        btn_chat = QPushButton("Gönder")
+        btn_chat.setStyleSheet("background:#00838f;color:#fff;font-weight:bold;padding:6px 12px;")
+        btn_chat.clicked.connect(self._send_chat)
+        crow.addWidget(btn_chat)
+        cv.addLayout(crow)
+        bottom.addWidget(chat_box, stretch=1)
+        root.addLayout(bottom, stretch=1)
+
+        # SAHA SOHBETİ ağı: merkeze (host:5006) yolla, 5006'da dinle (merkez hub dağıtır).
+        self.chat_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.chat_listener = ChatListener(port=5006)
+        self.chat_listener.received.connect(self._on_chat)
+        self.chat_listener.start()
 
         # --- Worker ---
         self.worker = AuxWorker(cfg)
@@ -627,8 +720,36 @@ class AuxWindow(QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {msg}")
 
+    def _send_chat(self):
+        text = self.chat_inp.text().strip()[:500]
+        if not text:
+            return
+        msg = {"type": "chat", "from": self.cfg["id"], "text": text, "ts": time.time()}
+        try:
+            self.chat_send_sock.sendto(json.dumps(msg).encode("utf-8"), (self.cfg["host"], 5006))
+        except OSError as e:
+            self.add_log(f"⚠️ Sohbet gönderilemedi: {e}")
+        self._append_chat(self.cfg["id"], text, msg["ts"])   # kendi mesajını göster
+        self.chat_inp.clear()
+
+    def _on_chat(self, d):
+        self._append_chat(d.get("from", "?"), d.get("text", ""), d.get("ts"))
+
+    def _append_chat(self, sender, text, ts=None):
+        tstr = time.strftime("%H:%M:%S", time.localtime(ts or time.time()))
+        color = "#00e5ff" if sender == "MERKEZ" else "#00e676"
+        safe = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        self.chat_log.append(f'<span style="color:#777">[{tstr}]</span> '
+                             f'<b style="color:{color}">{sender}:</b> {safe}')
+        sb = self.chat_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def closeEvent(self, e):
         self.worker.stop()
+        try:
+            self.chat_listener.stop()
+        except Exception:
+            pass
         e.accept()
 
 

@@ -141,11 +141,18 @@ class DSPProcessor:
         return round(float(power_dbfs), 1)
 
     def detect_signals(self, fft_dbm: np.ndarray, noise_floor, center_mhz: float,
-                       bandwidth_mhz: float, thresh_db: float = 10.0, min_width_bins: int = 3):
+                       bandwidth_mhz: float, thresh_db: float = 10.0, min_width_bins: int = 3,
+                       dc_guard_bins: int = 0, close_gap_bins: int = 0, prominence_db: float = 0.0):
         """SİNYAL TESPİTİ (5.1.1) — DAR + GENİŞ BANT birlikte. Verilen GÜRÜLTÜ TABANINI (tarihsel-min,
         self-masking'e bağışık) thresh_db aşan BİTİŞİK ENERJİ ADALARINI bulur. Her ada bir sinyaldir:
         sivri iğne (dar telsiz) küçük ada, düz masa (LTE/Wi-Fi) büyük ada. Uzman eleştirisi #1+#2'nin
         çözümü: medyan yerine tarihsel-min taban + tepe-arama yerine enerji-adası (bant genişliği verir).
+
+        prominence_db>0 (CFAR YEREL-BELİRGİNLİK): her ada, KENDİ ÇEVRESİNDEKİ (guard'lı komşuluk)
+        tabanı bu kadar dB aşmalı. Güçlü bir taşıyıcının duyarsızlaştırıp (desense) TÜM bandı yükselttiği
+        DÜZ gürültü tabanı yalancı tespit üretir; gerçek sinyal ise çevresine göre TEPE yapar. Yerel taban
+        adanın hemen yanından ölçülür -> düz yükselmiş taban elenir (yerel_taban≈tepe), gerçek tepe kalır.
+        Pencereyi büyük oranda dolduran GENİŞ sinyalde yerel taban güvenilmez -> kontrol atlanır (self-mask).
         Dönüş: [(freq_mhz, power_dbfs, snr_db, bw_mhz)] (güce göre azalan)."""
         fft = np.asarray(fft_dbm, dtype=float)
         nf = np.asarray(noise_floor, dtype=float)
@@ -154,7 +161,22 @@ class DSPProcessor:
             return []
         thr = nf + float(thresh_db)
         above = fft > thr
+        # BOŞLUK KAPATMA (morfolojik kapama): tek bir GENİŞ sinyalin tepesi Welch/interpolasyon
+        # dalgalanmasıyla eşiğin altına inip birçok küçük adaya BÖLÜNMESİN. close_gap_bins'ten kısa
+        # eşik-altı boşluklar doldurulur -> dalgalı geniş sinyal TEK tespit olur (parçalanma önlenir).
+        if close_gap_bins > 0:
+            prev_true = -1
+            for b in range(n):
+                if above[b]:
+                    gap = b - prev_true - 1
+                    if 0 < gap <= int(close_gap_bins) and prev_true >= 0:
+                        above[prev_true + 1:b] = True
+                    prev_true = b
         nf_med = float(np.median(nf))
+        # CFAR komşuluk boyutu: adanın yanından ~300 kHz'lik referans penceresi (guard'la ayrılır).
+        bin_hz = (float(bandwidth_mhz) * 1e6) / n if n > 0 else 1.0
+        neigh_bins = int(np.clip(300e3 / bin_hz, 8, n // 4)) if bin_hz > 0 else 8
+        wide_bypass = int(0.5 * n)      # pencerenin yarısından geniş ada -> CFAR atla (geniş sinyal)
         out = []
         i = 0
         while i < n:
@@ -167,9 +189,26 @@ class DSPProcessor:
                     idx = np.arange(i, j)
                     w = np.power(10.0, (seg - nf[i:j]) / 10.0)     # enerji ağırlığı (doğrusal)
                     centroid = float(np.sum(idx * w) / (np.sum(w) + 1e-12))
+                    # DC/LO SIZINTI FİLTRESİ: pencere merkezindeki (n/2) DAR tepe SDR'nin kendi DC
+                    # offset'idir (gerçek sinyal değil). Yalnızca DAR ve merkeze YAKIN ada elenir;
+                    # merkezi geçen GENİŞ gerçek sinyal bölünmeden korunur. dc_guard_bins=0 -> kapalı.
+                    if dc_guard_bins > 0 and (j - i) <= (2 * dc_guard_bins + 2) \
+                            and abs(centroid - n / 2.0) <= dc_guard_bins:
+                        i = j
+                        continue
                     freq = center_mhz + (centroid - n / 2.0) / n * bandwidth_mhz
                     bw = (j - i) / n * bandwidth_mhz
                     peak = float(np.max(seg))
+                    # CFAR YEREL-BELİRGİNLİK: adanın hemen yanındaki tabanı prominence_db aşmalı.
+                    # (Pencereyi dolduran geniş sinyalde komşuluk güvenilmez -> atla; tarihsel-min yakalar.)
+                    if prominence_db > 0 and (j - i) < wide_bypass:
+                        guard = max(2, j - i)      # adanın eteğini referansa katma
+                        lo1 = max(0, i - guard - neigh_bins); hi1 = max(0, i - guard)
+                        lo2 = min(n, j + guard);              hi2 = min(n, j + guard + neigh_bins)
+                        ref = np.concatenate((fft[lo1:hi1], fft[lo2:hi2]))
+                        if ref.size >= 4 and (peak - float(np.median(ref))) < float(prominence_db):
+                            i = j
+                            continue                # düz yükselmiş taban -> gerçek sinyal değil
                     out.append((round(float(freq), 4), round(peak, 1),
                                 round(float(peak - nf_med), 1), round(float(bw), 4)))
                 i = j

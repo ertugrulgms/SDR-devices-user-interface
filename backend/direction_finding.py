@@ -323,29 +323,53 @@ class NodeBearingStore:
         self.stale_sec = stale_sec
         self._lock = threading.Lock()
         self._bearings = {}   # id -> {azimuth_deg, elevation_deg, amp_dbm, snr_db, freq_mhz, ts}
+        self._live = {}       # id -> (live_angle_deg, ts)  CANLI enkoder açısı (kerterizden BAĞIMSIZ)
 
     def update_from_json(self, msg: dict) -> bool:
-        """Ağdan gelen JSON kerteriz mesajını doğrular ve kaydeder. Beklenen şema:
-        {"id","azimuth_deg",["elevation_deg"],["amp_dbm"],["snr_db"],["freq_mhz"]}.
-        Otonom: geçerli mesaj gelir gelmez depoya işlenir. Dönüş: kabul edildi mi."""
+        """Ağdan gelen JSON mesajını işler. Şema:
+        {"id",["azimuth_deg"],["elevation_deg"],["amp_dbm"],["snr_db"],["freq_mhz"],["live_angle_deg"]}.
+        azimuth_deg (KERTERİZ) varsa füzyon deposuna, live_angle_deg (CANLI açı) varsa ayrı canlı depoya
+        yazılır. Canlı açı KERTERİZ GEREKTİRMEZ -> aux, tepe bulmadan da anlık yönünü anında iletir.
+        Dönüş: en az biri işlendiyse True."""
         nid = msg.get("id")
-        if not nid or "azimuth_deg" not in msg:
+        if not nid:
             return False
-        try:
-            rec = {
-                "azimuth_deg": float(msg["azimuth_deg"]) % 360.0,
-                "elevation_deg": float(msg.get("elevation_deg", 0.0)),
-                "amp_dbm": float(msg.get("amp_dbm", -120.0)),
-                "snr_db": float(msg.get("snr_db", 0.0)),
-                "freq_mhz": float(msg.get("freq_mhz", 0.0)),
-                "ts": time.time(),
-                "source": "network",
-            }
-        except (TypeError, ValueError):
-            return False
+        nid = str(nid)
+        now = time.time()
+        handled = False
+        # CANLI açı (kerterizsiz de olabilir) -> ayrı depo, anlık gösterim için
+        if msg.get("live_angle_deg") is not None:
+            try:
+                with self._lock:
+                    self._live[nid] = (float(msg["live_angle_deg"]) % 360.0, now)
+                handled = True
+            except (TypeError, ValueError):
+                pass
+        # KERTERİZ (füzyon için) -> yalnızca azimuth_deg varsa
+        if "azimuth_deg" in msg:
+            try:
+                rec = {
+                    "azimuth_deg": float(msg["azimuth_deg"]) % 360.0,
+                    "elevation_deg": float(msg.get("elevation_deg", 0.0)),
+                    "amp_dbm": float(msg.get("amp_dbm", -120.0)),
+                    "snr_db": float(msg.get("snr_db", 0.0)),
+                    "freq_mhz": float(msg.get("freq_mhz", 0.0)),
+                    "ts": now,
+                    "source": "network",
+                }
+                with self._lock:
+                    self._bearings[nid] = rec
+                handled = True
+            except (TypeError, ValueError):
+                pass
+        return handled
+
+    def live_angles(self, now: float = None):
+        """Taze CANLI enkoder açıları: {id: derece}. Aux antenin anlık yönü (kerterizden bağımsız)."""
+        now = time.time() if now is None else now
         with self._lock:
-            self._bearings[str(nid)] = rec
-        return True
+            return {nid: ang for nid, (ang, ts) in self._live.items()
+                    if (now - ts) <= self.stale_sec}
 
     def set_self_bearing(self, node_id: str, azimuth_deg, elevation_deg=0.0,
                          amp_dbm=-120.0, snr_db=0.0, freq_mhz=0.0):

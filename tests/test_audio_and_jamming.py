@@ -6,6 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.audio_demodulator import AudioDemodulator
+from backend.audio_player import AudioPlayer
 from backend.jamming_generator import JammingGenerator
 
 
@@ -38,6 +39,31 @@ class TestAudioDemodulator(unittest.TestCase):
             for s in stages:
                 prod *= s
             self.assertEqual(prod, q, f"q={q} çarpanları {stages} -> {prod}")
+
+
+class TestAudioPlayerSquelch(unittest.TestCase):
+    """SQUELCH: sinyal yokken sesi kuyruğa yazmamalı (sessizlik), sinyal varken yazmalı."""
+
+    def setUp(self):
+        # Donanımsız oynatıcı: _producer'ı elle çağırmayız; enqueue mantığını doğrudan test ederiz.
+        self.p = AudioPlayer(engine=None, sample_rate=2_400_000, mode="FM")
+        self.p._running = True
+
+    def test_squelch_default_open(self):
+        self.assertTrue(self.p._squelch_open)
+
+    def test_squelch_toggle(self):
+        self.p.set_squelch_open(False)
+        self.assertFalse(self.p._squelch_open)
+        self.p.set_squelch_open(True)
+        self.assertTrue(self.p._squelch_open)
+
+    def test_out_rate_scales_with_bandwidth(self):
+        # 2.4 MHz -> 48 kHz tam; 10 MHz -> ~48 kHz (decim 208). Örnekleme hızıyla ölçeklenir.
+        self.assertEqual(round(self.p.out_rate), 48000)
+        p10 = AudioPlayer(engine=None, sample_rate=10_000_000, mode="FM")
+        self.assertGreater(p10.out_rate, 40000)
+        self.assertLess(p10.out_rate, 60000)
 
 
 class TestJammingGenerator(unittest.TestCase):

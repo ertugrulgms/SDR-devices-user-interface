@@ -11,6 +11,7 @@ class ControlPanel(QWidget):
     toggle_capture = pyqtSignal()
     open_tx_dialog = pyqtSignal()
     scan_toggled = pyqtSignal()          # BANT TARA aç/kapa (sinyal tespiti, 5.1.1)
+    scan_sensitivity_changed = pyqtSignal(int)   # tarama hassasiyeti (CFAR yerel-belirginlik, dB)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -167,6 +168,28 @@ class ControlPanel(QWidget):
         
         layout.addLayout(scan_row)
 
+        # Tarama HASSASİYETİ (CFAR yerel-belirginlik eşiği). Güçlü bir sinyalin yükselttiği düz gürültü
+        # tabanı yalancı tespit üretir; bu sürgü "gerçek bir sinyal, çevresini kaç dB aşmalı" der.
+        # SOL=Hassas (zayıf sinyali de bulur, gürültü artabilir) — SAĞ=Seçici (sadece net sinyaller).
+        sens_row = QHBoxLayout()
+        sens_row.setSpacing(8)
+        self.lbl_sens_cap = QLabel("Tarama Hassasiyeti:")
+        self.lbl_sens_cap.setStyleSheet("font-size: 13px; font-weight: bold; color: #ce93d8;")
+        sens_row.addWidget(self.lbl_sens_cap)
+        self.sens_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sens_slider.setRange(6, 22)      # dB; düşük=hassas, yüksek=seçici
+        self.sens_slider.setValue(12)         # varsayılan = SCAN_PROMINENCE_DB (dengeli, temiz gelir)
+        self.sens_slider.setToolTip(
+            "Bir tespit, ÇEVRESİNDEKİ gürültü tabanını en az bu kadar (dB) aşmalı.\n"
+            "Sol = Hassas (zayıf sinyalleri de bulur, gürültü artabilir)\n"
+            "Sağ = Seçici (sadece net/güçlü sinyaller — kalabalık ortamda temiz liste)")
+        self.sens_slider.valueChanged.connect(self._on_sens_changed)
+        sens_row.addWidget(self.sens_slider, stretch=3)
+        self.lbl_sens_val = QLabel("Dengeli (12 dB)")
+        self.lbl_sens_val.setStyleSheet("font-size: 12px; color: #b0b0b0; min-width: 110px;")
+        sens_row.addWidget(self.lbl_sens_val)
+        layout.addLayout(sens_row)
+
         # NOT: "Tespit Edilen Sinyaller" listesi ALT SATIRDAKİ DetectionPanel'e taşındı
         # (ui/widgets/detection_panel.py) — orada daha geniş, ilk-görülme saatli, çift-tıkla-tune'lu
         # ve CSV'ye aktarılabilir. Burada yalnızca tarama BUTONU ve aralık kutuları kalır.
@@ -176,6 +199,11 @@ class ControlPanel(QWidget):
     def on_gain_changed(self, value):
         self.gain_label.setText(f"{value} dB")
         self.gain_changed.emit(value)
+
+    def _on_sens_changed(self, value):
+        tier = "Seçici" if value >= 15 else ("Hassas" if value <= 9 else "Dengeli")
+        self.lbl_sens_val.setText(f"{tier} ({value} dB)")
+        self.scan_sensitivity_changed.emit(value)
 
     def set_capturing_state(self, is_capturing: bool):
         if is_capturing:
