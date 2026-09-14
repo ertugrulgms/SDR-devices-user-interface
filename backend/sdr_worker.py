@@ -65,6 +65,8 @@ DF_SIGNAL_PRESENT_DB = 6.0        # genlik-DF örneği YALNIZCA sinyal bu SNR'yi
                                   # halde (kaynak sustuğunda) gürültü tepesi azimut-genlik haritasını
                                   # kirletir ve sahte kerteriz üretirdi (sıralı yayın senaryosu).
 DF_PEAK_WINDOW_BINS = 2          # genlik ölçümünde tepe etrafı ±bin entegrasyonu (tek-bin gürültüsü)
+DF_FUSION_FREQ_TOL_MHZ = 0.1     # füzyon: düğüm kerterizi ancak hedef frekansına ±bu kadar yakınsa
+                                 # katılır (farklı frekanstaki aux başka hedefi ölçüyordur -> dışla)
 
 # --- RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1) ---
 SCAN_DETECT_DB = 10.0             # sinyal, TARİHSEL-MİN gürültü tabanını bu kadar aşarsa tespit
@@ -126,7 +128,8 @@ class SDRWorker(QThread):
         self.df_registry = load_node_registry()
         self.self_id = self_node_id(self.df_registry)
         # Uzak düğümlerden ağ (UDP/JSON) ile gelen + yerel üretilen kerterizlerin thread-safe deposu.
-        self.node_store = NodeBearingStore(stale_sec=5.0)
+        self.node_store = NodeBearingStore(stale_sec=2.0)   # 5.0 idi: ölü/donuk aux'un ESKİ kerterizi
+        # 5 sn füzyona girip hareketli hedefte konumu geriye çekiyordu. Aux 10 Hz gönderir -> 2 sn yeter.
         # Yerel (ana) düğümün genlik-tabanlı kerteriz kestiricisi (enkoder azimutu + ölçülen genlik).
         self.self_amp_df = AmplitudeDFEstimator()
 
@@ -781,6 +784,26 @@ class SDRWorker(QThread):
         lin = np.power(10.0, np.asarray(fft_dbm[lo:hi]) / 10.0)
         return float(10.0 * np.log10(np.mean(lin) + 1e-12))
 
+    def _target_power_dbm(self, fft_dbm) -> float:
+        """HEDEF KANALI gücü (uzman P0.3): bandın GLOBAL tepesi DEĞİL, MERKEZ ±80 kHz'teki en güçlü
+        tepe (±DF_PEAK_WINDOW_BINS entegre). Kullanıcı hedefe tune eder; yön bulurken ortamda daha
+        güçlü bir parazit belirse bile ana cihaz HEDEFE sadık kalır (uzak parazit ±80 kHz dışında
+        kalır -> ölçüme girmez). Hedef tam merkezde (DC) olsa bile tepe-arama onu bulur (mean-removal
+        LO dikenini zaten azaltır; ayrıca DC-hariç bastırma YOK -> merkezdeki gerçek hedef silinmez)."""
+        n = len(fft_dbm)
+        if n < 8:
+            return -120.0
+        c = n // 2
+        bin_hz = self.sample_rate / n if n > 0 else 1.0
+        wbin = int(np.clip(80e3 / bin_hz, 8, n // 4)) if bin_hz > 0 else 8
+        lo, hi = max(0, c - wbin), min(n, c + wbin + 1)
+        band = np.asarray(fft_dbm[lo:hi], dtype=float)
+        pk = int(np.argmax(band))
+        w = DF_PEAK_WINDOW_BINS
+        lo2, hi2 = max(0, pk - w), min(len(band), pk + w + 1)
+        lin = np.power(10.0, band[lo2:hi2] / 10.0)
+        return float(10.0 * np.log10(np.mean(lin) + 1e-12))
+
     def _run_direction_finding(self, iq1, spectrum_info=None):
         """GERÇEK YÖN BULMA + KONUM (genlik-tabanlı DF + 3B LOB üçgenleme).
 
@@ -793,12 +816,13 @@ class SDRWorker(QThread):
         3) DERECE RMS: yerel kerteriz, kalibrasyon referansıyla kıyaslanır (şartname 5.1.4).
         Dönüş: payload'a konacak df sözlüğü. (Sentetik iq2/iq3 faz-DF tamamen kaldırıldı.)"""
         now = time.time()
-        # GENLİK-DF için HEDEF (en güçlü sinyal) gücünü kullan — TOPLAM bant gücünü DEĞİL. Yönlü
-        # antenin hedefe tepkisi tepe gücüyle ölçülür. Tek-bin tepe gürültülüdür; tepe etrafı ±W bin
-        # DOĞRUSAL güç entegrasyonu ile sağlam bir tepe-güç ölçümü alınır (Derece RMS'yi iyileştirir).
+        # GENLİK-DF için HEDEF KANALI gücünü kullan — bandın GLOBAL en güçlüsünü DEĞİL (uzman P0.3).
+        # Kullanıcı taramayla hedefi bulup ORAYA tune eder; yön bulurken ortamda başka güçlü bir sinyal
+        # belirse bile ana cihaz HEDEFE sadık kalmalı (aux ile aynı yöntem). _target_power_dbm: merkez
+        # ±80 kHz'te tepe ARAYIP ±W bin entegre eder (uzak parazit dışlanır, hedef merkezde bile ölçülür).
         fft_dbm = getattr(self, "_last_fft_dbm", None)
         if fft_dbm is not None and len(fft_dbm) > 0:
-            self_amp = self._robust_peak_power_dbm(fft_dbm)
+            self_amp = self._target_power_dbm(fft_dbm)
         else:
             self_amp = self.dsp.compute_channel_power_dbm(iq1)
 
@@ -826,7 +850,11 @@ class SDRWorker(QThread):
             if self.hw_ctrl.is_connected:
                 enc_az = self.hw_ctrl.get_angle()
                 if present:
-                    self.self_amp_df.update(enc_az, self_amp, now)
+                    # AGC KOMPANZASYONU (uzman P0.1): anten dönerken AGC kazancı değişirse ölçülen güç
+                    # yalnızca anten yönlülüğünü DEĞİL kazanç değişimini de taşır -> DF biası. Ölçülen
+                    # dBFS'ten O ANKİ kazancı ÇIKAR -> antene-referanslı (kazanç-bağımsız) güç. Böylece
+                    # AGC açık kalsa da (kırpma koruması sürer) DF haritası kazançtan etkilenmez.
+                    self.self_amp_df.update(enc_az, self_amp - self.gain_db, now)
                 self_bearing, pk, conf, n = self.self_amp_df.bearing(now)
                 if self_bearing is not None:
                     self.node_store.set_self_bearing(self.self_id, self_bearing, 0.0, self_amp,
@@ -848,6 +876,12 @@ class SDRWorker(QThread):
         for nid, rec in active.items():
             cfg = self.df_registry.get(nid)
             if not cfg:
+                continue
+            # FREKANS EŞLEŞTİRME (uzman P0.5): yalnızca ŞU ANKİ hedef frekansındaki (±tolerans) kerterizler
+            # füzyona girsin. Farklı frekanstaki bir aux BAŞKA bir hedefi ölçüyordur -> onun kerterizi bu
+            # hedefin üçgenlemesine sokulmamalı (yanlış konum önlenir). freq_mhz=0 ise bilinmiyor, dahil et.
+            node_freq = float(rec.get("freq_mhz", 0.0) or 0.0)
+            if node_freq > 0 and abs(node_freq - self.center_freq_mhz) > DF_FUSION_FREQ_TOL_MHZ:
                 continue
             positions.append(cfg["pos"])
             directions.append(azel_to_unit(rec["azimuth_deg"], rec["elevation_deg"]))

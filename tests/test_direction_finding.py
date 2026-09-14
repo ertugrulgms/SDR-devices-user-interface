@@ -255,6 +255,33 @@ class TestDFFixesRegression(unittest.TestCase):
         self.assertGreater(p, -60.0)     # tepe civarı güç yüksek
         self.assertLess(p, -49.0)        # ama tek-bin -50'yi aşmaz (ortalama)
 
+    def test_df_locks_target_channel_not_stronger_interferer(self):
+        # HEDEF-KANAL (uzman P0.3): hedef GÜNEYDE (180°), MERKEZDE. Bandın başka yerinde SÜREKLİ ve
+        # DAHA GÜÇLÜ bir parazit var. Ana DF, GLOBAL tepeye (parazit) DEĞİL hedef kanalına kilitlenmeli.
+        w = SDRWorker()
+        hw = self._fake_encoder(w)
+        for az in range(150, 211, 2):
+            hw.a = az
+            d = ((az - 180 + 180) % 360) - 180
+            tgt = -90 + 40 * np.cos(np.radians(d)) ** 8 if abs(d) < 90 else -90   # hedef ışını (merkez)
+            fft = np.full(2048, -100.0)
+            fft[1024] = tgt          # HEDEF: merkez (tune edilen frekans)
+            fft[1400] = -35.0        # PARAZİT: merkez-dışı, hedeften GÜÇLÜ, açıdan bağımsız
+            w._last_fft_dbm = fft
+            w._run_direction_finding(np.ones(2048, np.complex64) * 0.01, {"snr_db": 60.0})
+        b, _, _, _ = w.self_amp_df.bearing()
+        self.assertIsNotNone(b)
+        self.assertLess(abs(((b - 180 + 180) % 360) - 180), 6.0)   # güneye kilitlendi (parazite kaymadı)
+
+    def test_target_power_ignores_far_interferer(self):
+        # _target_power_dbm: merkezdeki ZAYIF hedefi ölçmeli, ±80 kHz DIŞINDAKİ güçlü parazite atlamamalı
+        w = SDRWorker(); w.set_bandwidth(2.4)
+        fft = np.full(2048, -100.0)
+        fft[1024] = -55.0        # merkez hedef (zayıf)
+        fft[1600] = -30.0        # uzak parazit (çok güçlü, ±80 kHz dışında)
+        p = w._target_power_dbm(fft)
+        self.assertLess(p, -45.0)    # hedefi (~-55) ölçtü, parazite (-30) atlamadı
+
 
 class TestProtocolSymbolRate(unittest.TestCase):
     def test_baud_distinguishes_dmr(self):
