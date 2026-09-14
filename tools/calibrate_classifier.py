@@ -31,8 +31,9 @@ def analyze(path: str, fs: float, label: str = None):
     bw = clf.estimate_bandwidth_hz(iq)
     baud = clf.estimate_symbol_rate_hz(iq)
     mux, prom, nfft = clf.detect_multiplex(iq)
-    work = clf._channelize(iq)
-    feats = clf.extract_features(work, clf.WORK_FS) if len(work) >= 256 else {}
+    # _channelize (work_iq, iso_fs) TUPLE döner; len(tuple)=2 hep <256'ydı -> özellik boş kalıyordu (bug).
+    work_iq, iso_fs = clf._channelize(iq)
+    feats = clf.extract_features(work_iq, iso_fs) if len(work_iq) >= 256 else {}
     result = clf.classify(iq)
 
     print(f"\n=== {os.path.basename(path)}  (fs={fs/1e6:.3f} MHz, N={len(iq)}"

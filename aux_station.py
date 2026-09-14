@@ -462,9 +462,10 @@ class AuxWorker(QThread):
             bin_hz = (self.cfg["rate"] * 1e6) / FFT_POINTS
             wbin = int(np.clip(80e3 / bin_hz, 8, FFT_POINTS // 4))
             band = np.array(fft_dbm[c - wbin:c + wbin + 1], dtype=float)
-            band[wbin - 1:wbin + 2] = -300.0                   # DC ±1 bin bastır (LO dikeni). Sadece
-            # tam-merkez bin(ler)i; ±2 idi (~±2 kHz) ve HEDEF tam LO'ya denk gelirse onu da bastırıyordu
-            # (uzman #1). En sağlamı: aux'u hedeften ~50-100 kHz OFFSET tune et -> hedef DC'ye oturmaz.
+            # DC bastırma KALDIRILDI (P0-04): merkeze denk gelen gerçek HEDEF artık silinmiyor. FFT
+            # zaten (iq - mean) ile hesaplandığından LO dikeni bastırılmış durumda; ayrıca "present"
+            # (SNR) kapısı zayıf DC dikenini eler. Yine de en sağlamı: aux'u hedeften ~50-100 kHz
+            # OFFSET tune etmek -> hedef DC'ye hiç oturmaz. Merkez ±80 kHz'te en güçlü tepe alınır.
             pk = int(np.argmax(band))
             lo_i, hi_i = max(0, pk - 2), min(len(band), pk + 3)
             seg = np.power(10.0, band[lo_i:hi_i] / 10.0)
@@ -759,7 +760,8 @@ class AuxWindow(QMainWindow):
 def _auto_node_id():
     """Kendi 192.168.1.x IP'sinden düğüm id'sini türet: .20 -> NODE-2, .30 -> NODE-3.
     Böylece her yardımcı bilgisayar --id yazmadan sadece `python aux_station.py` ile çalışır
-    (statik IP'ler: ana=.10, NODE-2=.20, NODE-3=.30). Bulamazsa güvenli varsayılan NODE-2."""
+    (statik IP'ler: ana=.10, NODE-2=.20, NODE-3=.30). BULAMAZSA None döner -> main() AÇIKÇA HATA verir.
+    (Eskiden NODE-2'ye düşüyordu; iki aux da beklenmedik IP alırsa İKİSİ DE NODE-2 olup çakışıyordu — P2-03.)"""
     ips = set()
     try:  # merkez IP'ye UDP 'connect' -> paket GÖNDERMEZ, yalnızca yerel arayüzü/IP'yi seçer
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -780,7 +782,7 @@ def _auto_node_id():
                 return "NODE-2"
             if last == "30":
                 return "NODE-3"
-    return "NODE-2"
+    return None   # eşleşme yok -> çakışma riski; sessizce NODE-2'ye DÜŞME, main() hata versin
 
 
 def main():
@@ -798,6 +800,9 @@ def main():
     ap.add_argument("--sim", action="store_true", help="Donanımsız simülasyon (arayüz testi)")
     a = ap.parse_args()
     node_id = a.id if a.id else _auto_node_id()     # --id verilmediyse IP'den türet
+    if not node_id:                                  # IP eşleşmedi + --id yok -> ÇAKIŞMA riski, dur
+        sys.exit("HATA: Düğüm id belirlenemedi (IP 192.168.1.20/.30 değil). Çakışmayı önlemek için "
+                 "--id NODE-2 (veya NODE-3) ile açıkça belirtin. Sessizce NODE-2'ye düşülmez.")
     cfg = {"id": node_id, "sdr": a.sdr, "host": a.host, "port": a.port, "enc": a.enc, "baud": a.baud,
            "freq": a.freq, "rate": a.rate, "gain": a.gain, "rate_hz": DEFAULTS["rate_hz"], "sim": a.sim}
 
