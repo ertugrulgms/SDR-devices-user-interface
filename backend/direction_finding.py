@@ -52,6 +52,13 @@ def bearing_from_positions(observer_xyz, target_xyz):
 # Bunun altında ışınlar neredeyse paralel -> küçük açı hatası devasa konum hatası verir (kötü GDOP);
 # "güvenli ama yanlış" konum yerine dürüstçe "zayıf geometri (fix yok)" bildirilir.
 MIN_CROSSING_ANGLE_DEG = 5.0
+# KALINTI (residual) kapısı: kerterizler tutarsızsa (biri yanlış/yansımalı) ışınlar iyi kesişmez ->
+# dik kalıntı büyür. Kesişim açısı iyi olsa bile YÜKSEK kalıntı = güvenilmez fix. Kalıntı, hedef
+# MENZİLİNE göre değerlendirilir (uzak hedefte küçük açı hatası büyük mutlak kalıntı verir). GEVŞEK
+# eşik: yalnızca AŞIRI tutarsız geometriyi reddeder (geçerli fix'i düşürmesin).
+MAX_RESIDUAL_FRAC = 0.12         # kalıntı/menzil bunu aşarsa fix güvenilmez. Ampirik: gerçekçi ±2°
+                                 # gürültü ~0.02-0.06; bir kerteriz 25-40° yanlışsa ~0.10-0.16 -> ayrışır.
+MAX_RESIDUAL_FLOOR_M = 30.0      # yakın hedefte mutlak alt taban (oran çok küçük menzilde katı olmasın)
 
 
 def lob_crossing_angle_deg(directions) -> float:
@@ -123,8 +130,12 @@ def triangulate_lob(positions, directions):
     # Herhangi bir düğüm hedefi arkasında "görüyorsa" geometri fiziksel olarak tutarsızdır -> fix YOK
     # (sahte-güvenli konum üretilmez; sistemin genel dürüstlük ilkesiyle uyumlu).
     forward_ok = all(float(np.dot(x - p, d)) > 0.0 for p, d in zip(positions, directions))
+    # KALINTI KAPISI (uzman #16): kerterizler tutarsızsa kesişim açısı iyi olsa bile kalıntı büyür ->
+    # fix güvenilmez. Menzile göre (oran) değerlendir; gevşek eşik (yalnız aşırı tutarsızı reddet).
+    range_m = float(np.linalg.norm(x - np.mean(positions, axis=0)))
+    residual_ok = res <= max(MAX_RESIDUAL_FLOOR_M, MAX_RESIDUAL_FRAC * range_m)
     # GDOP kapısı: geometri çok zayıfsa (ışınlar ~paralel) konum güvenilmez -> fix yok.
-    fix = (cross_deg >= MIN_CROSSING_ANGLE_DEG) and forward_ok
+    fix = (cross_deg >= MIN_CROSSING_ANGLE_DEG) and forward_ok and residual_ok
     return x, round(res, 2), fix, round(cross_deg, 1)
 
 
@@ -134,7 +145,8 @@ def triangulate_lob(positions, directions):
 class AmplitudeDFEstimator:
     """GENLİK TABANLI DF: anten ELLE döndürülürken (azimut, genlik) örnekleri gelir; en yüksek
     genliğin azimutu = kaynağın geliş yönü. Tepe etrafında genlik-ağırlıklı merkez (centroid) ile
-    alt-derece hassasiyet sağlanır. Örnekler zamanla sönümlenir (yeniden tarama / hareketli kaynak).
+    hassasiyet sağlanır (ANTEN HÜZME GENİŞLİĞİYLE sınırlı; LPDA'da ±birkaç derece, "alt-derece" değil).
+    Örnekler zamanla sönümlenir (yeniden tarama / hareketli kaynak).
 
     Kullanım (yerel düğüm): her karede update(enkoder_azimutu, ölçülen_genlik_dBm). bearing()
     o ana kadarki taramadan en olası kerterizi verir."""
@@ -178,7 +190,7 @@ class AmplitudeDFEstimator:
         peak_amp = float(amps[peak_i])
         floor = float(np.min(amps))
 
-        # Tepe etrafında (±window) genlik-ağırlıklı dairesel centroid (alt-derece hassasiyet)
+        # Tepe etrafında (±window) genlik-ağırlıklı dairesel centroid (hassasiyet hüzme genişliğiyle sınırlı)
         offs = ((azs - peak_az + 180.0) % 360.0) - 180.0     # tepeye göre [-180,180]
         mask = np.abs(offs) <= self.window_deg
         w = np.power(10.0, (amps[mask] - floor) / 10.0)       # dBm -> doğrusal güç ağırlığı
@@ -190,76 +202,9 @@ class AmplitudeDFEstimator:
         return round(bearing_deg, 2), round(peak_amp, 1), round(conf, 2), len(self._bins)
 
 
-# ------------------------------------------------------------------ #
-#  HAREKETLİ TEK ALICI ile KONUM (spec 5.1.5)
-# ------------------------------------------------------------------ #
-class MovingReceiverPositioner:
-    """HAREKET HALİNDEKİ TEK ALICI ile konum belirleme (spec 5.1.5).
-
-    Platform (GPS'li) hareket ederken FARKLI konumlardan kaynağa kerteriz (LOB) alınır. Bu
-    (konum, yön) örnekleri biriktirilip üçgenlenir -> kaynağın konumu. Tek bir hareketli alıcı,
-    çok sayıda sabit alıcının yaptığını zamanda tarayarak yapar.
-
-    MEKÂNSAL ÇEŞİTLİLİK ŞARTI: yeni örnek yalnızca alıcı bir öncekinden `min_baseline_m` kadar
-    UZAKLAŞMIŞSA eklenir; aksi halde tüm örnekler ~aynı noktadadır ve üçgenleme tabanı (baz) oluşmaz.
-    Kaynak, birikim süresince sabit varsayılır (şartname: kaynaklar sırayla yayın yapar).
-
-    Konumlar yerel ENU metre (GPS -> geo.geodetic_to_enu ile çevrilir). Sentetik veri yok:
-    örnekler yalnızca gerçek GPS konumu + gerçek kerterizden gelir.
-    """
-
-    def __init__(self, min_baseline_m: float = 15.0, max_samples: int = 40,
-                 decay_sec: float = 120.0):
-        self.min_baseline_m = float(min_baseline_m)
-        self.max_samples = int(max_samples)
-        self.decay_sec = float(decay_sec)
-        self._samples = []   # list of (pos[np3], direction[np3], ts)
-
-    def reset(self):
-        self._samples.clear()
-
-    def add(self, pos_enu, bearing_deg: float, elevation_deg: float = 0.0, now: float = None) -> bool:
-        """Bir (konum, kerteriz) örneği ekle. Yalnızca yeterince yer değiştirilmişse eklenir.
-        Dönüş: örnek eklendi mi (mekânsal çeşitlilik sağlandı mı)."""
-        now = time.time() if now is None else now
-        pos = np.asarray(pos_enu, float)
-        self._prune(now)
-        if self._samples:
-            last_pos = self._samples[-1][0]
-            if float(np.linalg.norm(pos - last_pos)) < self.min_baseline_m:
-                return False    # yeterince hareket edilmedi -> baz oluşmaz, örnek ALINMAZ
-        d = azel_to_unit(bearing_deg, elevation_deg)
-        self._samples.append((pos, d, now))
-        if len(self._samples) > self.max_samples:
-            self._samples.pop(0)
-        return True
-
-    def _prune(self, now):
-        self._samples = [s for s in self._samples if (now - s[2]) <= self.decay_sec]
-
-    def sample_count(self) -> int:
-        return len(self._samples)
-
-    def baseline_m(self) -> float:
-        """Biriken örneklerin kapladığı azami mesafe (üçgenleme tabanı büyüklüğü)."""
-        if len(self._samples) < 2:
-            return 0.0
-        pts = np.array([s[0] for s in self._samples])
-        d = 0.0
-        for i in range(len(pts)):
-            d = max(d, float(np.max(np.linalg.norm(pts - pts[i], axis=1))))
-        return round(d, 1)
-
-    def estimate(self, now: float = None):
-        """Biriken (konum, kerteriz) örneklerinden kaynağı üçgenle.
-        Dönüş: (konum[x,y,z], kalıntı_m, fix, kesişim_açısı_derece). <2 örnek -> fix yok."""
-        now = time.time() if now is None else now
-        self._prune(now)
-        if len(self._samples) < 2:
-            return np.zeros(3), 0.0, False, 0.0
-        positions = [s[0] for s in self._samples]
-        directions = [s[1] for s in self._samples]
-        return triangulate_lob(positions, directions)
+# NOT: "MovingReceiverPositioner" (spec 5.1.5 tek HAREKETLİ alıcı ile konum) KALDIRILDI —
+# saha kurulumu 3 SABİT istasyon + dönen yönlü anten. Konum bulma 3-düğüm LOB üçgenlemesiyle
+# (triangulate_lob + NodeBearingStore füzyonu) yapılıyor; hareketli-tek-alıcı yöntemi kullanılmıyor.
 
 
 # ------------------------------------------------------------------ #
@@ -319,7 +264,10 @@ class NodeBearingStore:
     (UDP/JSON) yazar; yerel (ana) düğüm kendi genlik-DF kerterizini yazar. Ana döngü okur ve
     üçgenler. Bayat (stale) ölçümler yaşlarına göre elenir (düğüm sustuysa füzyona katılmaz)."""
 
-    def __init__(self, stale_sec: float = 5.0):
+    def __init__(self, stale_sec: float = 2.0):
+        # stale_sec 5.0 -> 2.0: aux 10 Hz gönderdiği için taze veri hep <0.2 sn yaştadır. AUX kilitlenir/
+        # ağı koparsa, ESKİ kerterizi 5 sn boyunca "taze" sayıp füzyona sokmak HAREKETLİ hedefte konumu
+        # geriye çeker (bayat-veri zehirlenmesi). 2 sn'de düşür -> ölü düğüm hızla füzyondan atılır.
         self.stale_sec = stale_sec
         self._lock = threading.Lock()
         self._bearings = {}   # id -> {azimuth_deg, elevation_deg, amp_dbm, snr_db, freq_mhz, ts}

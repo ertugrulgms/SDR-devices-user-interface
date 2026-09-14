@@ -85,7 +85,8 @@ import pyqtgraph as pg
 # ----------------------------------------------------------------------------- #
 class AmplitudeDF:
     """(açı, güç) örneklerinden en yüksek gücün alındığı azimutu (kerteriz) verir.
-    Tepe etrafında güç-ağırlıklı dairesel merkez ile alt-derece hassasiyet. Örnekler zamanla söner
+    Tepe etrafında güç-ağırlıklı dairesel merkez (hassasiyet ANTEN HÜZME GENİŞLİĞİYLE sınırlıdır;
+    LPDA'da tipik ±birkaç derece — "alt-derece" değildir). Örnekler zamanla söner
     (yeniden tarama / kaynak değişimi)."""
 
     def __init__(self, bin_deg=1.0, window_deg=25.0, decay_sec=15.0):
@@ -461,7 +462,9 @@ class AuxWorker(QThread):
             bin_hz = (self.cfg["rate"] * 1e6) / FFT_POINTS
             wbin = int(np.clip(80e3 / bin_hz, 8, FFT_POINTS // 4))
             band = np.array(fft_dbm[c - wbin:c + wbin + 1], dtype=float)
-            band[wbin - 2:wbin + 3] = -300.0                   # DC ±2 bin bastır (LO dikeni)
+            band[wbin - 1:wbin + 2] = -300.0                   # DC ±1 bin bastır (LO dikeni). Sadece
+            # tam-merkez bin(ler)i; ±2 idi (~±2 kHz) ve HEDEF tam LO'ya denk gelirse onu da bastırıyordu
+            # (uzman #1). En sağlamı: aux'u hedeften ~50-100 kHz OFFSET tune et -> hedef DC'ye oturmaz.
             pk = int(np.argmax(band))
             lo_i, hi_i = max(0, pk - 2), min(len(band), pk + 3)
             seg = np.power(10.0, band[lo_i:hi_i] / 10.0)
@@ -616,7 +619,7 @@ class AuxWindow(QMainWindow):
         self.lbl_angle = QLabel("Açı: --°")
         self.lbl_angle.setStyleSheet("color:#00e676;font-size:40px;font-weight:bold;")
         self.lbl_angle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_dbm = QLabel("dBm: --")
+        self.lbl_dbm = QLabel("dBFS: --")   # kalibrasyonsuz BAĞIL güç (gerçek dBm değil); DF için
         self.lbl_dbm.setStyleSheet("color:#4fc3f7;font-size:40px;font-weight:bold;")
         self.lbl_dbm.setAlignment(Qt.AlignmentFlag.AlignCenter)
         big.addWidget(self.lbl_angle)
@@ -704,7 +707,7 @@ class AuxWindow(QMainWindow):
         # Büyük göstergeler (None gelirse '—' göster, çökme)
         _az = d.get("azimuth"); _pk = d.get("peak_dbm")
         self.lbl_angle.setText(f"Açı: {_az:.1f}°" if _az is not None else "Açı: —")
-        self.lbl_dbm.setText(f"dBm: {_pk:.1f}" if _pk is not None else "dBm: —")
+        self.lbl_dbm.setText(f"dBFS: {_pk:.1f}" if _pk is not None else "dBFS: —")
 
         # Kerteriz
         if d["bearing"] is not None:

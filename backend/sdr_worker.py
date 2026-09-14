@@ -13,15 +13,13 @@ from backend.hardware_controller import HardwareController
 from backend.audio_demodulator import AudioDemodulator, StreamingDemodulator
 from backend.digital_voice import classify_fm_or_fsk
 from backend.signal_monitor import SignalMonitor
-from backend.gps_receiver import GPSReceiver
-from backend.geo import geodetic_to_enu
 from backend.signal_classifier import SignalClassifier, HoppingHistoryTracker
 from backend.param_consolidator import ParameterConsolidator
 from backend.tx_engine import TxWaveformBuilder, WIFI_BAND_CENTERS, WAV_DECEPTION_WAVE
 from backend.audio_deception import load_wav_mono, detect_ctcss, detect_dcs, extract_subaudio
 from backend.direction_finding import (NodeBearingStore, AmplitudeDFEstimator, azel_to_unit,
                                        triangulate_lob, bearing_from_positions,
-                                       load_node_registry, self_node_id, MovingReceiverPositioner,
+                                       load_node_registry, self_node_id,
                                        polar_to_enu, enu_to_polar, save_node_registry)
 
 # --- SOAPYSDR DONANIM KÜTÜPHANESİ KONTROLÜ ---
@@ -71,15 +69,22 @@ DF_PEAK_WINDOW_BINS = 2          # genlik ölçümünde tepe etrafı ±bin enteg
 # --- RF BANT TARAMA / SİNYAL TESPİTİ (şartname 5.1.1) ---
 SCAN_DETECT_DB = 10.0             # sinyal, TARİHSEL-MİN gürültü tabanını bu kadar aşarsa tespit
 SCAN_SETTLE_SEC = 0.04           # retune sonrası oturma; kısa tutuldu (FHSS/burst POI için, uzman #3)
-SCAN_MERGE_MHZ = 0.05            # bu aralıktaki tespitler aynı sinyal sayılır (birleştirilir)
+SCAN_MERGE_MHZ = 0.0125          # bitişik tespitleri birleştirme aralığı. PMR el telsizi KANAL ARALIĞI
+                                 # 12.5 kHz'dir; 0.05 (50 kHz) bitişik iki kanalı TEK sinyalde eziyordu.
+                                 # 12.5 kHz -> yan yana kanallar ayrı hedefler olarak görünür.
 SCAN_MAX_DETECTIONS = 400        # tespit listesi üst sınırı
-SCAN_CONFIRM_HITS = 2            # bir aday, listeye/loga girmeden önce bu kadar AYRI turda görülmeli
-                                 # (tek-karelik gürültü sıçramaları rastgele bin'lerde olur -> asla
-                                 #  aynı frekansta 2 kez üst üste gelmez -> yalancı-pozitif elenir)
-SCAN_CANDIDATE_TTL_SEC = 8.0     # onaylanmamış aday bu süre yeniden görülmezse düşürülür (bellek+temizlik)
-SCAN_DC_GUARD_BINS = 4           # pencere merkezindeki (n/2) DAR DC/LO sızıntı tepesini ele (B200 offset)
-SCAN_CLOSE_GAP_HZ = 15_000       # bu kadar kısa eşik-altı boşluklar kapatılır -> dalgalı geniş sinyal
-                                 # tek tespit olur (Welch/interp dalgalanmasıyla parçalanma önlenir)
+SCAN_CONFIRM_HITS = 1            # PTT (bas-konuş) telsizi/drone kumandası ANLIK yayın yapar; kaynak
+                                 # susunca 2. onay gelmez -> eskiden (2) bu sinyalleri KAÇIRIYORDU.
+                                 # 1 = ilk görüşte listeye al. Hayalet-selini CFAR+eşik+DC-guard eler
+                                 # (temporal onaya gerek kalmadı). Sahada çok yalancı-pozitif olursa 2 yap.
+SCAN_CANDIDATE_TTL_SEC = 8.0     # onaylanmamış aday bu süre yeniden görülmezse düşürülür (CONFIRM=1'de kullanılmaz)
+SCAN_DC_GUARD_BINS = 2           # merkezdeki (n/2) DAR DC/LO dikenini ele. 4 idi: merkeze denk gelen
+                                 # gerçek dar telsizi de siliyordu (kör nokta). 2 -> yalnız ~1-2 bin diken
+                                 # silinir; ~8 kHz'lik gerçek telsiz merkezde bile korunur.
+SCAN_CLOSE_GAP_HZ = 4_000        # bu kadar kısa eşik-altı boşluklar kapatılır (dalgalı sinyal parçalanmasın).
+                                 # 15 kHz idi: 12.5 kHz aralıklı bitişik PMR kanallarının arasını da
+                                 # köprüleyip tek sinyalde birleştiriyordu. 4 kHz -> kanallar ayrı kalır,
+                                 # ama tek sinyalin kendi içindeki küçük çentikler yine kapatılır.
 SCAN_SHOULDER_DB = 22.0          # bir tespit, YAKIN + çok daha güçlü bir sinyalin "omuz/etek" gölgesinde
                                  # (bu kadar dB zayıf) ise AYRI sinyal sayılmaz (baskın taşıyıcı eteği)
 SCAN_SHOULDER_SPAN_MULT = 1.5    # gölge yarıçapı = güçlü sinyalin bant genişliği × bu
@@ -147,14 +152,8 @@ class SDRWorker(QThread):
             self.hw_ctrl = HardwareController(port='/dev/ttyACM0')   # is_connected=False (dürüst: açı yok)
         _enc_port = self.hw_ctrl.port if self.hw_ctrl.is_connected else None
 
-        # HAREKETLİ TEK ALICI ile konum (spec 5.1.5): GPS'li platform hareket ederken farklı
-        # konumlardan alınan kerterizleri biriktirip üçgenler. GPS yoksa devreye girmez (sahte yok).
-        # ENKODER'in aldığı porta DOKUNMA (çakışma olmasın).
-        _gps_port = "/dev/ttyACM1" if _enc_port == "/dev/ttyACM0" else "/dev/ttyACM0"
-        self.gps = GPSReceiver(port=_gps_port)
-        self.gps.connect()
-        self.moving_positioner = MovingReceiverPositioner(min_baseline_m=15.0)
-        self._gps_ref = None    # ENU orijini (ilk fix'in lat/lon/alt'ı)
+        # NOT: HAREKETLİ TEK ALICI (spec 5.1.5, GPS'li platform) + GPSReceiver KALDIRILDI —
+        # saha kurulumu 3 SABİT istasyon. Konum bulma 3-düğüm LOB üçgenlemesiyle yapılıyor.
         self.udp_thread = None
         self.udp_socket = None
         # SOHBET (aux<->merkez, UDP 5006). Merkez=hub: gelen mesajı diğer düğümlere dağıtır.
@@ -622,6 +621,10 @@ class SDRWorker(QThread):
         # gerçek sinyalin sönümlenmesi olur. Ham Welch spektrumu yalnızca GÜNCEL kareden gelir ->
         # frekanslar arası kirlenme YOK; Welch segment-ortalaması sayesinde gürültü de düşük.
         self._last_raw_fft = raw_fft
+        # RETUNE/FFT SENKRON: bu FFT'nin HANGİ merkez frekansta alındığını damgala. Tarama, retune
+        # sonrası eski merkeze ait bir FFT'yi yeni merkezmiş gibi yorumlayıp SAHTE frekans üretmesin
+        # (uzman #10). _service_scan bu damgayı center_freq_mhz ile karşılaştırır.
+        self._last_raw_fft_center = self.center_freq_mhz
         # ZAMAN-ORTALAMA (doğrusal güç EMA, ~8 kare): gürültü varyansını düşürür -> zayıf kalıcı
         # sinyaller ortaya çıkar. Ortalanan spektrumda gürültü tepe-tabanı ~3 dB'e iner; bu yüzden
         # present_db düşürülebilir (weak sinyal yakalanır, gürültü yanlış-pozitifi olmaz).
@@ -768,20 +771,6 @@ class SDRWorker(QThread):
                 sample_count=self.df_tracker.sample_count())
             self._last_df_log_time = now
 
-    def _feed_moving_positioner(self, bearing_deg: float, now: float):
-        """GPS fix varsa alıcının anlık konumunu ENU'ya çevirip (konum, kerteriz) örneği ekler.
-        İlk fix ENU orijini olur. GPS yoksa/fix yoksa hiçbir şey yapmaz (sahte konum üretmez)."""
-        if self.gps is None or not self.gps.has_fix:
-            return
-        pos = self.gps.get_position()
-        if pos is None:
-            return
-        lat, lon, alt = pos
-        if self._gps_ref is None:
-            self._gps_ref = (lat, lon, alt)     # ilk fix -> yerel ENU orijini
-        enu = geodetic_to_enu(lat, lon, alt, self._gps_ref[0], self._gps_ref[1], self._gps_ref[2])
-        self.moving_positioner.add(enu, bearing_deg, 0.0, now)
-
     def _robust_peak_power_dbm(self, fft_dbm) -> float:
         """Tepe etrafı ±DF_PEAK_WINDOW_BINS bin DOĞRUSAL güç entegrasyonu ile sağlam tepe-güç (dBm).
         Tek-bin max'e göre gürültüye daha dayanıklı -> genlik-DF kerterizi daha kararlı (Derece RMS↓)."""
@@ -842,10 +831,6 @@ class SDRWorker(QThread):
                 if self_bearing is not None:
                     self.node_store.set_self_bearing(self.self_id, self_bearing, 0.0, self_amp,
                                                      snr_db=sig_snr, freq_mhz=self.center_freq_mhz)
-                    # HAREKETLİ TEK ALICI (5.1.5): GPS fix varsa, bu kerterizi alıcının GPS konumuyla
-                    # birlikte biriktir; platform hareket ettikçe farklı konumlardan kerterizler
-                    # üçgenlenerek kaynağın konumu bulunur. GPS yoksa bu blok atlanır (sahte yok).
-                    self._feed_moving_positioner(self_bearing, now)
                 else:
                     # Yerel kerteriz üretilemiyor (sinyal yok / yetersiz tarama) -> yerel kerterizi
                     # füzyondan düşür (bayat kalıp yanlış üçgenlemeye girmesin). Yalnızca ENKODER
@@ -908,19 +893,6 @@ class SDRWorker(QThread):
                 "live_angle_deg": live_ang.get(nid),
             })
 
-        # HAREKETLİ TEK ALICI (5.1.5): biriken (GPS konumu, kerteriz) örneklerinden ayrı bir konum
-        # kestirimi. Çok-düğüm füzyonundan bağımsız; GPS'li tek alıcı senaryosunu karşılar.
-        mv_pos, mv_res, mv_fix, mv_cross = self.moving_positioner.estimate(now)
-        moving = {
-            "fix": bool(mv_fix),
-            "position_xyz_m": [round(float(v), 2) for v in mv_pos],
-            "residual_m": mv_res,
-            "crossing_deg": mv_cross,
-            "samples": self.moving_positioner.sample_count(),
-            "baseline_m": self.moving_positioner.baseline_m(),
-            "gps": self.gps.status() if self.gps is not None else {"connected": False, "has_fix": False},
-        }
-
         return {
             "self_bearing_deg": self_bearing,
             "position_xyz_m": [round(float(v), 2) for v in pos],
@@ -938,7 +910,6 @@ class SDRWorker(QThread):
             "df_rms_deg": df_rms_deg,
             "df_reference_deg": self.df_tracker.reference_deg,
             "df_sample_count": self.df_tracker.sample_count(),
-            "moving": moving,     # hareketli tek alıcı (GPS) ile konum kestirimi
         }
 
     def _refine_fm_fsk(self, snap):
@@ -1237,7 +1208,6 @@ class SDRWorker(QThread):
             self.hop_tracker.reset()      # bant değişti -> eski tepe-frekans geçmişi anlamsız
             self.self_amp_df.reset()      # frekans değişti -> eski azimut-genlik haritası geçersiz
             self.tuned_nf.reset()         # bant değişti -> tarihsel-min gürültü tabanı yeniden öğrenilmeli
-            self.moving_positioner.reset()  # yeni kaynak -> biriken (konum, kerteriz) örnekleri geçersiz
             self._det_spectrum = None     # bant değişti -> zaman-ortalama sıfırlanmalı
             if hasattr(self, "param_consol"):
                 self.param_consol.reset()   # yeni frekans = yeni kaynak -> parametre penceresini temizle
@@ -1255,7 +1225,9 @@ class SDRWorker(QThread):
         lo = max(70.0, lo)
         hi = min(6000.0, hi)
         self.scan_start_mhz, self.scan_stop_mhz = lo, hi
-        self.scan_step_mhz = max(0.5, self.bandwidth_mhz * 0.9)   # pencereler örtüşecek şekilde adım
+        self.scan_step_mhz = max(0.5, self.bandwidth_mhz * 0.8)   # %20 örtüşme: pencere KENARINDAKİ
+                                                                  # sinyal komşu pencerede merkeze yakın
+                                                                  # yakalanır (uzman #11); hız kaybı ~%12
         self.scan_cursor_mhz = lo
         self.scan_detections = {}
         self._scan_candidates = {}      # onaylanmamış adaylar: key -> {..., hits, first_ts, last_ts}
@@ -1291,6 +1263,12 @@ class SDRWorker(QThread):
         # HAM (zaman-yumuşatılmamış) Welch spektrumu kullan -> retune'da frekanslar arası EMA
         # kirlenmesi/hayalet tespit YOK (bkz. _run_signal_analysis'teki _last_raw_fft notu).
         fft = getattr(self, "_last_raw_fft", None)
+        # RETUNE GUARD (uzman #10): FFT, ŞU ANKİ merkez frekansa ait değilse KULLANMA. Aksi halde
+        # retune sonrası henüz taze kare gelmeden eski merkezin spektrumunu yeni merkezmiş gibi
+        # yorumlayıp SAHTE frekans üretiriz (ör. 433.9'u 450 gösterir). Eşleşene dek bu turu atla.
+        fft_center = getattr(self, "_last_raw_fft_center", None)
+        if fft_center is None or abs(float(fft_center) - self.center_freq_mhz) > 1e-3:
+            return
         if fft is not None and len(fft) > 0:
             # TARİHSEL-MİN gürültü tabanı (bu merkez frekans için) — self-masking'e bağışık (uzman #1)
             ckey = round(self.center_freq_mhz * 10)
@@ -1319,24 +1297,26 @@ class SDRWorker(QThread):
                 # girmez -> yalancı-pozitif seli önlenir.
                 cand = self._scan_candidates.get(key)
                 if cand is None:
-                    self._scan_candidates[key] = {"freq_mhz": freq, "power_dbfs": pwr, "snr_db": snr,
-                                                  "bw_mhz": bw, "first_ts": now, "last_ts": now, "hits": 1}
+                    cand = {"freq_mhz": freq, "power_dbfs": pwr, "snr_db": snr,
+                            "bw_mhz": bw, "first_ts": now, "last_ts": now, "hits": 1}
+                    self._scan_candidates[key] = cand
                 else:
                     cand["hits"] += 1
                     cand["last_ts"] = now
                     if pwr > cand["power_dbfs"]:                 # aday da Max-Hold ile güçlensin
                         cand.update(freq_mhz=freq, power_dbfs=pwr, snr_db=snr, bw_mhz=bw)
-                    if cand["hits"] >= SCAN_CONFIRM_HITS:        # ONAYLANDI -> listeye + loga TEK sefer
-                        self.scan_detections[key] = {
-                            "freq_mhz": cand["freq_mhz"], "power_dbfs": cand["power_dbfs"],
-                            "snr_db": cand["snr_db"], "bw_mhz": cand["bw_mhz"], "ts": now,
-                            "first_ts": cand["first_ts"], "count": cand["hits"]}
-                        del self._scan_candidates[key]
-                        cbw, cf = cand["bw_mhz"], cand["freq_mhz"]
-                        bw_str = f", BG ~{cbw*1000:.0f} kHz" if cbw < 1.0 else f", BG ~{cbw:.1f} MHz"
-                        self.log_signal.emit(f"📡 TESPİT: {cf:.3f} MHz @ {cand['power_dbfs']:.0f} dBFS "
-                                             f"(SNR {cand['snr_db']:.0f} dB{bw_str})")
-                        self.logger.log_detection(cf, cand["power_dbfs"], cand["snr_db"])
+                # ONAY kontrolü HEM ilk görüşte HEM sonrakilerde (CONFIRM=1 -> ilk görüşte anında).
+                if cand["hits"] >= SCAN_CONFIRM_HITS:            # ONAYLANDI -> listeye + loga TEK sefer
+                    self.scan_detections[key] = {
+                        "freq_mhz": cand["freq_mhz"], "power_dbfs": cand["power_dbfs"],
+                        "snr_db": cand["snr_db"], "bw_mhz": cand["bw_mhz"], "ts": now,
+                        "first_ts": cand["first_ts"], "count": cand["hits"]}
+                    del self._scan_candidates[key]
+                    cbw, cf = cand["bw_mhz"], cand["freq_mhz"]
+                    bw_str = f", BG ~{cbw*1000:.0f} kHz" if cbw < 1.0 else f", BG ~{cbw:.1f} MHz"
+                    self.log_signal.emit(f"📡 TESPİT: {cf:.3f} MHz @ {cand['power_dbfs']:.0f} dBFS "
+                                         f"(SNR {cand['snr_db']:.0f} dB{bw_str})")
+                    self.logger.log_detection(cf, cand["power_dbfs"], cand["snr_db"])
             # Yeniden görülmeyen (onaylanmamış) adayları düşür -> gezici gürültü birikmez.
             if self._scan_candidates:
                 stale = [k for k, c in self._scan_candidates.items()
@@ -1531,9 +1511,6 @@ class SDRWorker(QThread):
         self._is_running = False
         # Ses oynatıcıyı durdur (hoparlör akışı + üretici thread)
         self._stop_audio()
-        # GPS alıcı thread'ini kapat
-        if getattr(self, "gps", None) is not None:
-            self.gps.disconnect()
         # TX aktifse ÖNCE güvenli kapat: aksi halde yayın sürer ve ET DURUMU "AKTİF" donar.
         if self.tx_active:
             self.tx_active = False
@@ -1938,7 +1915,6 @@ class SDRWorker(QThread):
                     "df_fix": df["fix"],
                     "df_fix_quality_deg": df.get("fix_quality_deg", 0.0),   # LOB kesişim açısı (GDOP)
                     "df_dimensionality": df.get("dimensionality", "-"),     # 2B (yer izdüşümü) / 3B
-                    "df_moving": df.get("moving"),                          # hareketli tek alıcı (GPS) konumu
                     "df_active_count": df["active_count"],
                     "df_remote_nodes": df.get("remote_nodes", []),   # uzak düğüm bağlantı durumu
                     "df_self_bearing_deg": df["self_bearing_deg"],

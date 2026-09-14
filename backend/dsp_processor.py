@@ -141,7 +141,7 @@ class DSPProcessor:
         return round(float(power_dbfs), 1)
 
     def detect_signals(self, fft_dbm: np.ndarray, noise_floor, center_mhz: float,
-                       bandwidth_mhz: float, thresh_db: float = 10.0, min_width_bins: int = 3,
+                       bandwidth_mhz: float, thresh_db: float = 10.0, min_width_bins: int = 2,
                        dc_guard_bins: int = 0, close_gap_bins: int = 0, prominence_db: float = 0.0):
         """SİNYAL TESPİTİ (5.1.1) — DAR + GENİŞ BANT birlikte. Verilen GÜRÜLTÜ TABANINI (tarihsel-min,
         self-masking'e bağışık) thresh_db aşan BİTİŞİK ENERJİ ADALARINI bulur. Her ada bir sinyaldir:

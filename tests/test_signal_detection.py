@@ -109,6 +109,7 @@ class TestScannerStateMachine(unittest.TestCase):
             self.w.scan_cursor_mhz = 400.0
             self.w._scan_settle_until = 0.0                  # oturmayı atla
             self.w._last_raw_fft = fft
+            self.w._last_raw_fft_center = self.w.center_freq_mhz
             self.w._service_scan()
         self.assertGreater(len(self.w.scan_detections), 0)   # onaylı tespit kaydedildi
         # Tespit bant genişliği taşıyor (dar+geniş bant motoru)
@@ -121,19 +122,34 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.start_scan_rf(400.0, 2500.0)
         self.w._scan_settle_until = 0.0
         self.w._last_raw_fft = np.full(2048, -80.0)          # sinyal gerekmez, sadece ilerleme
+        self.w._last_raw_fft_center = self.w.center_freq_mhz
         start_freq = self.w.center_freq_mhz
         self.w._service_scan()
         self.assertGreater(self.w.center_freq_mhz, start_freq)  # sonraki frekansa geçti
 
-    def test_single_frame_spike_not_confirmed(self):
-        # YALANCI-POZİTİF ELEME: tek bir karede görülen tepe (gezici gürültü) ASLA listeye girmez.
+    def test_single_frame_real_signal_detected_immediately(self):
+        # PTT/anlık sinyal: CONFIRM_HITS=1 -> gerçek bir sinyal (belirgin ada) TEK karede listeye girer
+        # (bas-konuş telsizi susmadan yakalanır). Hayalet-selini CFAR+eşik eler, temporal onaya gerek yok.
         self.w.set_bandwidth(20.0)
         self.w.start_scan_rf(400.0, 2500.0)
         self.w._scan_settle_until = 0.0
-        fft = np.full(2048, -80.0); fft[1000:1030] = -30.0
+        fft = np.full(2048, -80.0); fft[1000:1030] = -30.0   # gerçek sinyal adası (çevresi düşük)
         self.w._last_raw_fft = fft
-        self.w._service_scan()                               # yalnızca 1 tur görüldü
-        self.assertEqual(len(self.w.scan_detections), 0)     # onaylanmadı -> listede yok
+        self.w._last_raw_fft_center = self.w.center_freq_mhz
+        self.w._service_scan()                               # tek tur
+        self.assertGreater(len(self.w.scan_detections), 0)   # anında tespit (PTT kaçmaz)
+
+    def test_flat_raised_floor_rejected_single_frame(self):
+        # HAYALET ELEME (CONFIRM=1 olsa da): güçlü taşıyıcının yükselttiği DÜZ dalgalı taban -> CFAR
+        # yerel-belirginlik ile elenir; onay mekanizması olmadan da flood OLUŞMAZ.
+        self.w.set_bandwidth(2.4)
+        self.w.start_scan_rf(440.0, 450.0)
+        self.w._scan_settle_until = 0.0
+        rng = np.random.default_rng(7)
+        self.w._last_raw_fft = -40.0 + rng.standard_normal(2048) * 4.0   # düz yükselmiş taban (sinyal yok)
+        self.w._last_raw_fft_center = self.w.center_freq_mhz
+        self.w._service_scan()
+        self.assertLessEqual(len(self.w.scan_detections), 2)   # sel yok (CFAR eledi); en çok birkaç kalıntı
 
     def test_scan_no_self_masking_wideband(self):
         # SELF-MASKING (uzman #1): band önce boş, sonra TÜM pencereyi kaplayan dev sinyal gelir;
@@ -142,12 +158,14 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.start_scan_rf(400.0, 400.0)                   # tek frekans (revisit aynı merkez)
         self.w._scan_settle_until = 0.0
         self.w._last_raw_fft = np.full(2048, -80.0)          # 1) boş band -> düşük taban öğrenilir
+        self.w._last_raw_fft_center = self.w.center_freq_mhz
         self.w._service_scan()
         # 2) dev geniş-bant sinyal (band %100 dolu); onay için CONFIRM tur besle
         for _ in range(SCAN_CONFIRM_HITS):
             self.w.scan_cursor_mhz = 400.0                   # aynı merkeze dön
             self.w._scan_settle_until = 0.0
             self.w._last_raw_fft = np.full(2048, -35.0)
+            self.w._last_raw_fft_center = self.w.center_freq_mhz
             self.w._service_scan()
         self.assertGreater(len(self.w.scan_detections), 0)   # medyan körlenirdi; tarihsel-min yakaladı
 
@@ -156,6 +174,7 @@ class TestScannerStateMachine(unittest.TestCase):
         self.w.start_scan_rf(400.0, 2500.0)
         self.w._scan_settle_until = 0.0
         self.w._last_raw_fft = np.full(2048, -78.0)          # düz gürültü
+        self.w._last_raw_fft_center = self.w.center_freq_mhz
         self.w._service_scan()
         self.assertEqual(len(self.w.scan_detections), 0)     # sahte tespit YOK
 

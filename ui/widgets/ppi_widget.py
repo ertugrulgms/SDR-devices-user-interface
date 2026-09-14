@@ -39,13 +39,6 @@ class PPIWidget(QWidget):
         self.lbl_target.setWordWrap(True)
         layout.addWidget(self.lbl_target)
 
-        # Hareketli tek alıcı (GPS) ile konum (spec 5.1.5) — durum satırı
-        self.lbl_moving = QLabel("Hareketli Alıcı (GPS): kapalı")
-        self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #9e9e9e;")
-        self.lbl_moving.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_moving.setWordWrap(True)
-        layout.addWidget(self.lbl_moving)
-
         self.plot = pg.PlotWidget()
         self.plot.setBackground('#0d1b0d')             # koyu yeşil radar zemini
         self.plot.setAspectLocked(True)
@@ -122,32 +115,6 @@ class PPIWidget(QWidget):
         a = np.radians(az_deg)
         return r * np.sin(a), r * np.cos(a)
 
-    def _update_moving_label(self, mv):
-        """Hareketli tek alıcı (GPS) ile konum durumunu gösterir (spec 5.1.5)."""
-        if not mv:
-            self.lbl_moving.setText("Hareketli Alıcı (GPS): kapalı")
-            self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #9e9e9e;")
-            return
-        gps = mv.get("gps", {}) or {}
-        if not gps.get("connected"):
-            self.lbl_moving.setText("Hareketli Alıcı (GPS): alıcı bağlı değil")
-            self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #9e9e9e;")
-        elif not gps.get("has_fix"):
-            self.lbl_moving.setText(f"Hareketli Alıcı (GPS): fix bekleniyor ({gps.get('num_sats',0)} uydu)")
-            self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffb74d;")
-        elif mv.get("fix"):
-            p = mv.get("position_xyz_m", [0, 0, 0])
-            self.lbl_moving.setText(
-                f"Hareketli Alıcı (GPS) KONUM: X:{p[0]:.0f} Y:{p[1]:.0f} Z:{p[2]:.0f} m  |  "
-                f"{mv.get('samples',0)} örnek · baz {mv.get('baseline_m',0):.0f} m · "
-                f"kesişim {mv.get('crossing_deg',0):.0f}°")
-            self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #69f0ae;")
-        else:
-            self.lbl_moving.setText(
-                f"Hareketli Alıcı (GPS): örnek topluyor ({mv.get('samples',0)}, "
-                f"baz {mv.get('baseline_m',0):.0f} m) — hareket edin")
-            self.lbl_moving.setStyleSheet("font-size: 12px; font-weight: bold; color: #ffb74d;")
-
     def update_ppi(self, payload):
         """Worker payload'ından PPI'yı günceller: düğüm konumları/kerterizleri + hedef blip."""
         # CANLI ANTEN YÖN ÇİZGİSİ (ham enkoder açısı) — antenle birlikte akıcı döner. Kerterizden
@@ -159,7 +126,6 @@ class PPIWidget(QWidget):
         else:
             self.heading_line.setData([0.0, 0.0], [0.0, 0.0])
 
-        self._update_moving_label(payload.get("df_moving"))
         nodes = payload.get("df_nodes", {}) or {}
         fix = payload.get("df_fix", False)
         pos = payload.get("df_position_xyz_m", [0.0, 0.0, 0.0])
