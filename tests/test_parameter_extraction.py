@@ -40,7 +40,7 @@ class TestMultiplexClassification(unittest.TestCase):
         fdma = sum(nb(f, s) for f, s in [(-3e6, 1), (-1e6, 2), (1e6, 3), (3e6, 4)]).astype(np.complex64)
         fdma += (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * 0.02
         mux, _, _ = self._clf(fs).analyze_multiplex_ekkt(fdma)
-        self.assertTrue(mux.startswith("FDMA"), mux)
+        self.assertIn("FDMA", mux)   # "olası FDMA (...)" — dürüst etiket (bağımsız vericiler de olabilir)
 
     def test_dsss_detected_and_flags_ekkt(self):
         dsss = (np.random.default_rng(1).choice([-1, 1], self.N).astype(float) + 0j).astype(np.complex64)

@@ -379,13 +379,16 @@ class SignalClassifier:
         # tek geniş ada verir (ncar=1) -> OFDM'e düşer; FDMA'nın ayrık kanalları ncar>=3 verir.
         ncar = self._count_carriers(iq)
         if ncar >= 3:
-            return f"FDMA ({ncar} taşıyıcı)", False, 0.7
+            # "olası": birden fazla ayrık taşıyıcı FDMA olabilir ama BAĞIMSIZ vericiler de aynı görüntüyü
+            # verir -> kesin FDMA denemez (uzman #10). Dürüst etiket.
+            return f"olası FDMA ({ncar} taşıyıcı)", False, 0.7
         mux, prom, nfft = self.detect_multiplex(iq)
         if mux.startswith("OFDM"):
             return "OFDM (Çok Taşıyıcı)", False, self._margin_conf(prom, self.TH_OFDM_PROMINENCE, 10.0)
         occ, flat = self._occupancy_flatness(iq)
         if occ > self.TH_DSSS_OCC and flat > self.TH_DSSS_FLAT:
-            return "DSSS/CDMA (Yayılı Spektrum)", True, 0.65    # geniş+düz+OFDM değil -> yayılı spektrum
+            # "aday": geniş+düz spektrum DSSS OLABİLİR ama tek kesin kanıt değil (uzman #12) -> dürüst.
+            return "DSSS/CDMA adayı (Yayılı Spektrum)", True, 0.65
         if self._burst_duty(iq) < self.TH_TDMA_DUTY:
             return "TDMA-benzeri (Zaman-bölmeli)", False, 0.6
         return "Tek Taşıyıcı", False, 0.7

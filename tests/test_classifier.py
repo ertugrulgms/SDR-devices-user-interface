@@ -1,8 +1,9 @@
 """SignalClassifier (AMC) birim testleri — sentetik sinyallerle.
 
-KAPSAM (şimdilik): SADECE AM ve FM (analog). Dijital modülasyon türleri (PSK/QAM/OFDM/
-FSK/GMSK/CSS) test cihazı olmadığı için sınıflandırıcıda KAPALIDIR; ilgili testler de
-aşağıda yorum satırındadır (ileride dijital açılınca geri açılacak).
+KAPSAM: Analog (AM, FM) + DİJİTAL (BPSK, QPSK, 8PSK, QAM, FSK) modülasyon sınıflandırması
+AKTİFTİR ve sentetik üreteçlerle test edilir. Eşikler sentetik sinyallerden türetildi; gerçek
+RF kayıtlarıyla doğrulama gerekir (teşhis alanları sigma_dp/if_kurt/c40/c42 payload'da izlenir).
+NOT: OFDM çoklama + FHSS/DSSS EKKT testleri bu dosyada değil (ayrı ele alınır).
 
 Doğrulama stratejisi:
   * Yeterli SNR'de (>=15 dB) AM -> "AM (Analog-Genlik)", FM -> "FM (Analog-Frekans)".
