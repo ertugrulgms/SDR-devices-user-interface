@@ -131,6 +131,7 @@ class SDRWorker(QThread):
         self.node_store = NodeBearingStore(stale_sec=2.0)   # 5.0 idi: ölü/donuk aux'un ESKİ kerterizi
         # 5 sn füzyona girip hareketli hedefte konumu geriye çekiyordu. Aux 10 Hz gönderir -> 2 sn yeter.
         # Yerel (ana) düğümün genlik-tabanlı kerteriz kestiricisi (enkoder azimutu + ölçülen genlik).
+        # freq_hz pattern eşleştirme için gerekir; center_freq_mhz aşağıda ayarlanınca set_freq ile verilir.
         self.self_amp_df = AmplitudeDFEstimator()
 
         # ENKODER (ESP32/AS5600) — GPS'TEN ÖNCE bağlanır. ESP32-S3 native USB /dev/ttyACM0'da görünür;
@@ -166,6 +167,7 @@ class SDRWorker(QThread):
         self.CHAT_PORT = 5006
 
         self.center_freq_mhz = 2400.0
+        self.self_amp_df.set_freq(self.center_freq_mhz * 1e6)   # pattern eşleştirme frekansı
         self.gain_db = 40.0
         self.tx_gain_db = TX_GAIN_DEFAULT_DB   # TX RF kazancı (dB); artık arayüzden ayarlanır (bulgu #2)
         # Bant genişliği (spektrumda gösterilen frekans aralığının genişliği) her zaman
@@ -858,7 +860,8 @@ class SDRWorker(QThread):
                 self_bearing, pk, conf, n = self.self_amp_df.bearing(now)
                 if self_bearing is not None:
                     self.node_store.set_self_bearing(self.self_id, self_bearing, 0.0, self_amp,
-                                                     snr_db=sig_snr, freq_mhz=self.center_freq_mhz)
+                                                     snr_db=sig_snr, freq_mhz=self.center_freq_mhz,
+                                                     sigma_deg=self.self_amp_df.last_sigma())
                 else:
                     # Yerel kerteriz üretilemiyor (sinyal yok / yetersiz tarama) -> yerel kerterizi
                     # füzyondan düşür (bayat kalıp yanlış üçgenlemeye girmesin). Yalnızca ENKODER
@@ -872,7 +875,7 @@ class SDRWorker(QThread):
 
         # FÜZYON: taze kerterizleri düğüm konumlarıyla eşleyip 3B üçgenle
         active = self.node_store.active_bearings(now)
-        positions, directions = [], []
+        positions, directions, sigmas = [], [], []
         for nid, rec in active.items():
             cfg = self.df_registry.get(nid)
             if not cfg:
@@ -885,8 +888,10 @@ class SDRWorker(QThread):
                 continue
             positions.append(cfg["pos"])
             directions.append(azel_to_unit(rec["azimuth_deg"], rec["elevation_deg"]))
+            sigmas.append(float(rec.get("sigma_deg", 8.0)))   # pattern σ (küçük=hassas) -> 1/σ² ağırlık
         if len(positions) >= 2:
-            pos, residual_m, fix, cross_deg = triangulate_lob(positions, directions)
+            # AĞIRLIKLI üçgenleme: pattern-eşleşmiş (küçük σ) kerterizler baskın, belirsizler az etkiler.
+            pos, residual_m, fix, cross_deg = triangulate_lob(positions, directions, sigmas=sigmas)
         else:
             pos, residual_m, fix, cross_deg = (np.zeros(3), 0.0, False, 0.0)
 
@@ -1235,6 +1240,9 @@ class SDRWorker(QThread):
 
     def set_frequency(self, freq_mhz: float, quiet: bool = False):
         self.center_freq_mhz = float(freq_mhz)
+        # Pattern eşleştirme frekansa bağlı -> DF kestiriciye o anki frekansı bildir (kerteriz
+        # o frekansın kalibre pattern'iyle oturtulur; pattern yoksa etkisiz).
+        self.self_amp_df.set_freq(self.center_freq_mhz * 1e6)
         if self.use_hardware and hasattr(self, 'engine'):
             self.engine.set_frequency(self.center_freq_mhz * 1e6)
         if not quiet:

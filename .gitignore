@@ -19,8 +19,12 @@ backend/build/
 # bilerek depoda TUTULUR (takipten çıkarılmaz). Kendi ortamında yeniden
 # derlersen bu dosyanın üzerine yazılır — sorun değildir.
 
-# Ham IQ dökümleri ve veri klasörü
-data/
+# Ham IQ dökümleri ve veri klasörü ("data/" değil "data/*": aşağıdaki istisnanın çalışması için
+# klasörün kendisi değil İÇERİĞİ ignore edilir -> git klasöre girip istisnayı görebilir).
+data/*
+# İSTİSNA: anten pattern'i işlenmiş bir KALİBRASYON varlığıdır (ham veri değil) ve hem ana hem aux
+# istasyonlarda çalışma-zamanında gereklidir -> sürüm kontrolünde tutulur.
+!data/antenna_pattern.json
 raw_iq_dump_*.npy
 proje-inceleme.zip
 sdr_kod.txt

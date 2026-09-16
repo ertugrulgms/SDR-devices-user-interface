@@ -60,6 +60,14 @@ MAX_RESIDUAL_FRAC = 0.12         # kalıntı/menzil bunu aşarsa fix güvenilmez
                                  # gürültü ~0.02-0.06; bir kerteriz 25-40° yanlışsa ~0.10-0.16 -> ayrışır.
 MAX_RESIDUAL_FLOOR_M = 30.0      # yakın hedefte mutlak alt taban (oran çok küçük menzilde katı olmasın)
 
+# Kerteriz belirsizliği (σ, derece) — ağırlıklı üçgenlemede 1/σ² ağırlığı verir.
+# CENTROID yöntemi hüzme genişliğiyle sınırlı, kabaca ±birkaç derece: muhafazakâr sabit taban.
+SIGMA_CENTROID_DEG = 8.0
+# Pattern eşleşse de ön/arka oranı düşükse (belirsiz, 180° flip riski) σ bu katsayıyla şişirilir:
+# bearing atılmaz ama üçgenlemede düşük ağırlık alır; flip olursa forward-ray/residual kapıları eler.
+SIGMA_LOWQ_PENALTY = 4.0
+from backend.antenna_pattern import SIGMA_CEIL_DEG   # σ tavanı (pattern modülüyle ortak)
+
 
 def lob_crossing_angle_deg(directions) -> float:
     """LOB'lar arasındaki EN İYİ (en geniş) kesişim açısı, derece. 0°=paralel (kötü), 90°=dik (ideal).
@@ -73,7 +81,7 @@ def lob_crossing_angle_deg(directions) -> float:
     return best
 
 
-def triangulate_lob(positions, directions):
+def triangulate_lob(positions, directions, sigmas=None):
     """3B LOB (kerteriz doğrusu) EN-KÜÇÜK-KARELER üçgenlemesi + GEOMETRİ (GDOP) kapısı.
 
     Her düğüm i, konum p_i'den d_i yönünde bir ışın (LOB) tanımlar. Işınlar gürültü yüzünden tam
@@ -87,6 +95,10 @@ def triangulate_lob(positions, directions):
     güvenilmezdir -> fix=False (sahte-güvenli konum üretilmez).
     İLERİ-YÖN kapısı: çözüm herhangi bir düğümün kerteriz ışınının ARKASINDAysa (hayalet hedef)
     -> fix=False. Işınlar yön taşır; matematiksel doğrular taşımaz.
+
+    AĞIRLIK (sigmas): her düğümün kerteriz belirsizliği σ_i (derece) verilirse, o düğüm en-küçük-
+    karelerde 1/σ_i² ile ağırlıklanır -> hassas (pattern-eşleşmiş, küçük σ) kerterizler baskın olur,
+    belirsiz (düşük ön/arka) olanlar az etkiler. sigmas=None -> eşit ağırlık (eski davranış).
     """
     positions = [np.asarray(p, float) for p in positions]
     directions = [np.asarray(d, float) / (np.linalg.norm(d) + 1e-12) for d in directions]
@@ -95,10 +107,15 @@ def triangulate_lob(positions, directions):
 
     cross_deg = lob_crossing_angle_deg(directions)
 
+    if sigmas is not None and len(sigmas) == len(directions):
+        wts = [1.0 / max(float(s), 1e-3) ** 2 for s in sigmas]
+    else:
+        wts = [1.0] * len(directions)
+
     A = np.zeros((3, 3))
     b = np.zeros(3)
-    for p, d in zip(positions, directions):
-        P = np.eye(3) - np.outer(d, d)
+    for p, d, wt in zip(positions, directions, wts):
+        P = wt * (np.eye(3) - np.outer(d, d))
         A += P
         b += P @ p
 
@@ -151,16 +168,40 @@ class AmplitudeDFEstimator:
     Kullanım (yerel düğüm): her karede update(enkoder_azimutu, ölçülen_genlik_dBm). bearing()
     o ana kadarki taramadan en olası kerterizi verir."""
 
-    def __init__(self, bin_deg: float = 1.0, window_deg: float = 25.0, decay_sec: float = 15.0):
+    def __init__(self, bin_deg: float = 1.0, window_deg: float = 25.0, decay_sec: float = 15.0,
+                 freq_hz: float = None, use_pattern: bool = True):
         self.bin_deg = bin_deg
         self.window_deg = window_deg          # tepe etrafı centroid penceresi
         self.decay_sec = decay_sec            # bu süreden eski açı örnekleri unutulur. ELLE dönüşte
                                               # (~10 sn/tur) 8 sn kısaydı: tur bitmeden ilk taranan
                                               # bin'ler silinip 360° resmi eksik kalabiliyordu -> 15 sn.
         self._bins = {}                       # az_bin(int) -> (amp_dbm, ts)
+        # PATTERN EŞLEŞTİRME (şartname 5.1.4 Derece RMS): ölçülen VNA pattern'i varsa kerteriz tüm
+        # eğrinin ŞEKLİNE oturtularak (sadece tepe/centroid değil) çok daha hassas + belirsizlik (σ)
+        # ile kestirilir. freq_hz kaynağın frekansı; None ise pattern kullanılmaz (centroid'e düşer).
+        self.freq_hz = freq_hz
+        self._pattern = None
+        if use_pattern:
+            try:
+                from backend.antenna_pattern import shared_pattern
+                ap = shared_pattern()
+                self._pattern = ap if ap.available() else None
+            except Exception:
+                self._pattern = None
+
+        self._last_sigma = SIGMA_CENTROID_DEG   # son bearing()'in belirsizliği (derece) — ağırlıklı üçgenleme için
+        self._last_method = "centroid"          # "pattern" | "centroid" (teşhis / arayüz)
 
     def reset(self):
         self._bins.clear()
+
+    def set_freq(self, freq_hz):
+        """Kaynak frekansını ayarlar (pattern eşleştirme frekansa bağlı). None -> pattern kapalı."""
+        self.freq_hz = float(freq_hz) if freq_hz else None
+
+    def last_sigma(self) -> float:
+        """Son bearing() çağrısının kerteriz belirsizliği (derece). Üçgenlemede 1/σ² ağırlık için."""
+        return self._last_sigma
 
     def update(self, azimuth_deg: float, amp_dbm: float, now: float = None):
         now = time.time() if now is None else now
@@ -180,6 +221,8 @@ class AmplitudeDFEstimator:
         Yeterli tarama yoksa azimut None döner (dürüstçe 'ölçülemedi')."""
         now = time.time() if now is None else now
         self._prune(now)
+        self._last_sigma = SIGMA_CENTROID_DEG
+        self._last_method = "centroid"
         if len(self._bins) < 3:
             return None, -120.0, 0.0, len(self._bins)
 
@@ -199,6 +242,19 @@ class AmplitudeDFEstimator:
 
         # Güven: tepe-taban farkı ne kadar büyükse o kadar yüksek (0..1), ~20 dB'de doyar
         conf = float(min(1.0, max(0.0, (peak_amp - floor) / 20.0)))
+
+        # PATTERN EŞLEŞTİRME ile RAFİNE (şartname 5.1.4): ölçülen VNA pattern'i + frekans varsa,
+        # tüm eğriyi kalibre pattern'e oturtarak çok daha hassas kerteriz + σ elde et. Başarısız
+        # (az örnek / frekans yok / pattern yok) ise centroid sonucunu koru.
+        if self._pattern is not None and self.freq_hz:
+            m = self._pattern.match(azs, amps, self.freq_hz)
+            if m is not None:
+                bearing_deg = m["bearing_deg"]
+                sigma = m["sigma_deg"]
+                if not m["quality_ok"]:
+                    sigma = min(SIGMA_CEIL_DEG, sigma * SIGMA_LOWQ_PENALTY)  # düşük ön/arka -> düşük ağırlık
+                self._last_sigma = sigma
+                self._last_method = "pattern"
         return round(bearing_deg, 2), round(peak_amp, 1), round(conf, 2), len(self._bins)
 
 
@@ -302,6 +358,8 @@ class NodeBearingStore:
                     "amp_dbm": float(msg.get("amp_dbm", -120.0)),
                     "snr_db": float(msg.get("snr_db", 0.0)),
                     "freq_mhz": float(msg.get("freq_mhz", 0.0)),
+                    # sigma_deg: aux'un kerteriz belirsizliği (pattern-eşleşmede küçük). Yoksa centroid tabanı.
+                    "sigma_deg": float(msg.get("sigma_deg", SIGMA_CENTROID_DEG)),
                     "ts": now,
                     "source": "network",
                 }
@@ -320,8 +378,9 @@ class NodeBearingStore:
                     if (now - ts) <= self.stale_sec}
 
     def set_self_bearing(self, node_id: str, azimuth_deg, elevation_deg=0.0,
-                         amp_dbm=-120.0, snr_db=0.0, freq_mhz=0.0):
-        """Yerel (ana) düğümün genlik-DF kerterizini yazar. azimuth None ise ölçüm yok sayılır."""
+                         amp_dbm=-120.0, snr_db=0.0, freq_mhz=0.0, sigma_deg=SIGMA_CENTROID_DEG):
+        """Yerel (ana) düğümün genlik-DF kerterizini yazar. azimuth None ise ölçüm yok sayılır.
+        sigma_deg: kerteriz belirsizliği (pattern-eşleşmede küçük) -> ağırlıklı üçgenlemede kullanılır."""
         if azimuth_deg is None:
             with self._lock:
                 self._bearings.pop(node_id, None)
@@ -331,7 +390,8 @@ class NodeBearingStore:
                 "azimuth_deg": float(azimuth_deg) % 360.0,
                 "elevation_deg": float(elevation_deg),
                 "amp_dbm": float(amp_dbm), "snr_db": float(snr_db),
-                "freq_mhz": float(freq_mhz), "ts": time.time(), "source": "local",
+                "freq_mhz": float(freq_mhz), "sigma_deg": float(sigma_deg),
+                "ts": time.time(), "source": "local",
             }
 
     def active_bearings(self, now: float = None):

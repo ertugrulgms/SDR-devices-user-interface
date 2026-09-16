@@ -16,6 +16,9 @@ ARAYÜZDE YALNIZCA: RF (frekans/kazanç) · Spektrum · Açı · dBm  (+ kerteri
 
 Kurulum (her yardımcı laptopta):  pip install PyQt6 pyqtgraph pyserial numpy soapysdr
   Pluto için:  SoapyPlutoSDR    |    N210/B200 için:  SoapyUHD  (SoapySDR eklentileri)
+  PATTERN (opsiyonel ama önerilir): data/antenna_pattern.json'u bu dosyanın yanına (veya data/ altına)
+  kopyala -> pattern-eşleştirmeli DF açılır (kerteriz çok daha hassas + σ ile ağırlıklı üçgenleme).
+  Dosya yoksa sistem sessizce centroid yöntemine düşer (çalışmaya devam eder).
 
 Çalıştırma:
   # Pluto istasyonu:
@@ -25,6 +28,7 @@ Kurulum (her yardımcı laptopta):  pip install PyQt6 pyqtgraph pyserial numpy s
   # Donanımsız arayüz testi (sahte sinyal + sahte açı):
   python aux_station.py --id NODE-2 --sim
 """
+import os
 import sys
 import json
 import time
@@ -83,20 +87,117 @@ import pyqtgraph as pg
 #  GENLİK-TABANLI KERTERİZ KESTİRİCİ (anten elle döndürülürken tepe açıyı bulur)
 #  (Merkezdeki backend.direction_finding.AmplitudeDFEstimator'ın kompakt, bağımsız kopyası.)
 # ----------------------------------------------------------------------------- #
+# --- ÖLÇÜLEN VNA PATTERN (opsiyonel) — merkezdeki backend.antenna_pattern'ın bağımsız kompakt kopyası.
+#     antenna_pattern.json aux_station.py'nin YANINDA (veya data/ altında) varsa pattern-eşleştirmeli
+#     DF açılır (kerteriz + σ çok daha hassas); yoksa sessizce centroid'e düşer. σ merkeze gönderilip
+#     ağırlıklı üçgenlemede kullanılır.
+_AUX_SIGMA_CENTROID = 8.0
+_AUX_SIGMA_CEIL = 45.0
+_AUX_SIGMA_FLOOR = 1.5
+_AUX_SIGMA_LOWQ = 4.0
+_AUX_MIN_FB_DB = 10.0
+_AUX_MIN_SAMPLES = 8
+
+
+class _AuxPattern:
+    """antenna_pattern.json yükleyip pattern-eşleştirme (template matching) yapar. available()=False
+    ise merkezdeki mantıkla birebir aynı şekilde centroid'e düşülür. ASLA sentetik veri üretmez."""
+
+    def __init__(self):
+        self._ok = False
+        here = os.path.dirname(os.path.abspath(__file__))
+        for p in (os.path.join(here, "data", "antenna_pattern.json"),
+                  os.path.join(here, "antenna_pattern.json")):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                self._freqs = np.asarray(d["freqs_hz"], float)
+                self._angles = np.asarray(d["angles_deg"], float)
+                self._pat = np.asarray(d["pattern_db"], float)
+                q = d.get("quality", {})
+                self._fb = np.asarray(q.get("front_back_db", []), float)
+                self._pk = np.asarray(q.get("peak_angle_deg", []), float)
+                if self._pat.shape == (len(self._freqs), len(self._angles)) and len(self._freqs) >= 2:
+                    self._ok = True
+                    break
+            except (OSError, ValueError, KeyError, json.JSONDecodeError, TypeError):
+                continue
+
+    def available(self):
+        return self._ok
+
+    def match(self, az_deg, power_db, freq_hz):
+        """(az, güç) örneklerini frekansın kalibre pattern'ine oturtur -> {bearing_deg, sigma_deg,
+        quality_ok, ...} veya None. Merkezdeki backend.antenna_pattern.match ile aynı algoritma."""
+        if not self._ok:
+            return None
+        az = np.asarray(az_deg, float) % 360.0
+        pm = np.asarray(power_db, float)
+        n = len(az)
+        if n < _AUX_MIN_SAMPLES or n != len(pm):
+            return None
+        i = int(np.argmin(np.abs(self._freqs - float(freq_hz))))
+        ang = self._angles; pref = self._pat[i]
+        fb = float(self._fb[i]) if len(self._fb) > i else 0.0
+        pk = float(self._pk[i]) if len(self._pk) > i else 0.0
+        pm = pm - np.max(pm)
+        ae = np.concatenate([ang - 360.0, ang, ang + 360.0])
+        pe = np.concatenate([pref, pref, pref])
+
+        def pref_bore(x):
+            return np.interp((np.asarray(x) + pk) % 360.0, ae, pe)
+
+        betas = np.arange(0.0, 360.0, 1.0)
+        cost = np.array([float(np.dot(pm - pref_bore(b - az), pm - pref_bore(b - az))) for b in betas])
+        kmin = int(np.argmin(cost)); beta = float(betas[kmin]); cmin = float(cost[kmin])
+        c0, c1, c2 = cost[(kmin - 1) % len(betas)], cost[kmin], cost[(kmin + 1) % len(betas)]
+        a = 0.5 * (c0 + c2 - 2.0 * c1)
+        if a > 1e-9:
+            beta = (beta + 0.5 * (c0 - c2) / (c0 - 2.0 * c1 + c2)) % 360.0
+            sigma = float(np.sqrt(max(cmin, 1e-9) / max(n - 1, 1) / a))
+        else:
+            sigma = _AUX_SIGMA_CEIL
+        sigma = float(np.clip(sigma, _AUX_SIGMA_FLOOR, _AUX_SIGMA_CEIL))
+        quality_ok = (fb >= _AUX_MIN_FB_DB) and (a > 1e-9) and (sigma < _AUX_SIGMA_CEIL)
+        return {"bearing_deg": round(beta, 2), "sigma_deg": round(sigma, 2),
+                "quality_ok": bool(quality_ok), "n": n, "front_back_db": round(fb, 1)}
+
+
+_AUX_PATTERN = None
+
+
+def _aux_pattern():
+    global _AUX_PATTERN
+    if _AUX_PATTERN is None:
+        _AUX_PATTERN = _AuxPattern()
+    return _AUX_PATTERN
+
+
 class AmplitudeDF:
     """(açı, güç) örneklerinden en yüksek gücün alındığı azimutu (kerteriz) verir.
     Tepe etrafında güç-ağırlıklı dairesel merkez (hassasiyet ANTEN HÜZME GENİŞLİĞİYLE sınırlıdır;
     LPDA'da tipik ±birkaç derece — "alt-derece" değildir). Örnekler zamanla söner
-    (yeniden tarama / kaynak değişimi)."""
+    (yeniden tarama / kaynak değişimi). Ölçülen VNA pattern'i varsa kerteriz pattern-eşleştirmeyle
+    RAFİNE edilir + belirsizlik (σ) üretilir (merkeze gönderilip ağırlıklı üçgenlemede kullanılır)."""
 
-    def __init__(self, bin_deg=1.0, window_deg=25.0, decay_sec=15.0):
+    def __init__(self, bin_deg=1.0, window_deg=25.0, decay_sec=15.0, freq_hz=None, use_pattern=True):
         self.bin_deg = bin_deg
         self.window_deg = window_deg
         self.decay_sec = decay_sec
         self._bins = {}   # az_bin -> (amp_dbm, ts)
+        self.freq_hz = freq_hz
+        self._pattern = _aux_pattern() if use_pattern and _aux_pattern().available() else None
+        self._last_sigma = _AUX_SIGMA_CENTROID
+        self._last_method = "centroid"
 
     def reset(self):
         self._bins.clear()
+
+    def set_freq(self, freq_hz):
+        self.freq_hz = float(freq_hz) if freq_hz else None
+
+    def last_sigma(self):
+        return self._last_sigma
 
     def update(self, azimuth_deg, amp_dbm, now=None):
         now = time.time() if now is None else now
@@ -111,9 +212,11 @@ class AmplitudeDF:
             del self._bins[k]
 
     def bearing(self, now=None):
-        """(azimut|None, tepe_dBm, güven[0..1], örnek_sayısı)."""
+        """(azimut|None, tepe_dBm, güven[0..1], örnek_sayısı). σ ayrıca last_sigma() ile alınır."""
         now = time.time() if now is None else now
         self._prune(now)
+        self._last_sigma = _AUX_SIGMA_CENTROID
+        self._last_method = "centroid"
         if len(self._bins) < 3:
             return None, -120.0, 0.0, len(self._bins)
         azs = np.array([k * self.bin_deg for k in self._bins.keys()])
@@ -126,6 +229,16 @@ class AmplitudeDF:
         centroid = float(np.sum(offs[mask] * w) / (np.sum(w) + 1e-12))
         bearing = (peak_az + centroid) % 360.0
         conf = float(min(1.0, max(0.0, (peak_amp - floor) / 20.0)))
+        # PATTERN EŞLEŞTİRME ile RAFİNE (merkezle aynı): frekans + pattern varsa tüm eğriyi oturt.
+        if self._pattern is not None and self.freq_hz:
+            m = self._pattern.match(azs, amps, self.freq_hz)
+            if m is not None:
+                bearing = m["bearing_deg"]
+                sigma = m["sigma_deg"]
+                if not m["quality_ok"]:
+                    sigma = min(_AUX_SIGMA_CEIL, sigma * _AUX_SIGMA_LOWQ)
+                self._last_sigma = sigma
+                self._last_method = "pattern"
         return round(bearing, 2), round(peak_amp, 1), round(conf, 2), len(self._bins)
 
 
@@ -381,7 +494,7 @@ class AuxWorker(QThread):
         self.gain_db = cfg["gain"]
         self.cal_offset_db = 0.0        # dBFS -> dBm kaba düzeltme (opsiyonel)
         self.sending = True             # merkeze otomatik gönderim
-        self.df = AmplitudeDF()
+        self.df = AmplitudeDF(freq_hz=self.freq_hz)   # pattern eşleştirme frekansı
         self.enc = EncoderReader(cfg["enc"], cfg["baud"])
         self.sdr = make_sdr(cfg)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -392,6 +505,7 @@ class AuxWorker(QThread):
     def set_frequency_mhz(self, mhz):
         self.freq_hz = mhz * 1e6
         self.sdr.set_frequency(self.freq_hz)
+        self.df.set_freq(self.freq_hz)  # pattern eşleştirme frekansı güncellensin
         self.df.reset()                 # frekans değişti -> eski açı-güç haritası geçersiz
         self._last_bearing = None       # önbellekli kerterizi de temizle (yeni frekans = yeni hedef)
         self.log.emit(f"Frekans -> {mhz:.4f} MHz (kerteriz sıfırlandı)")
@@ -484,7 +598,7 @@ class AuxWorker(QThread):
             # göndermeye devam et -> bağlantı YEŞİL kalır, kerteriz kalıcı olur (sabit istasyon/hedef).
             # Yeni tarama (anteni çevirince) ya da frekans/reset ile önbellek güncellenir/temizlenir.
             if bearing is not None:
-                self._last_bearing = (bearing, bpk, conf, ncnt)
+                self._last_bearing = (bearing, bpk, conf, ncnt, self.df.last_sigma())
             tx = self._last_bearing
 
             # 4) Merkeze gönder (JSON/UDP) — CANLI AÇI HER ZAMAN (kerteriz olmasa da), hız sınırlı.
@@ -505,6 +619,8 @@ class AuxWorker(QThread):
                 if tx is not None:                          # kerteriz bulunduysa ekle
                     msg["azimuth_deg"] = round(tx[0], 2)
                     msg["elevation_deg"] = 0.0
+                    if len(tx) > 4:                          # pattern σ (ağırlıklı üçgenleme için)
+                        msg["sigma_deg"] = round(tx[4], 2)
                 try:
                     self.sock.sendto(json.dumps(msg).encode("utf-8"), (self.cfg["host"], self.cfg["port"]))
                     sent = True

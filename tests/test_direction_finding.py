@@ -223,6 +223,8 @@ class TestDFFixesRegression(unittest.TestCase):
         # Şartname senaryosu: kaynaklar SIRAYLA yayın yapar -> hedef çoğu zaman KAPALI. Kaynak
         # sustuğunda gürültü tepesi genlik-DF haritasını kirletip sahte kerteriz üretmemeli.
         w = SDRWorker()
+        w.self_amp_df.set_freq(None)   # bu test SNR/kirlenme kapısını sınar (pattern değil); sentetik
+                                       # cos^8 hüzme + dar yay pattern-eşleşmeye uygun değil -> kapat
         hw = self._fake_encoder(w)
         # 1) Sinyal VAR: 137° civarı ışın taraması (yüksek SNR) -> kerteriz oluşur
         for az in range(110, 165, 2):
@@ -259,6 +261,7 @@ class TestDFFixesRegression(unittest.TestCase):
         # HEDEF-KANAL (uzman P0.3): hedef GÜNEYDE (180°), MERKEZDE. Bandın başka yerinde SÜREKLİ ve
         # DAHA GÜÇLÜ bir parazit var. Ana DF, GLOBAL tepeye (parazit) DEĞİL hedef kanalına kilitlenmeli.
         w = SDRWorker()
+        w.self_amp_df.set_freq(None)   # hedef-kanal seçimini sınar (pattern değil); sentetik dar yay
         hw = self._fake_encoder(w)
         for az in range(150, 211, 2):
             hw.a = az
@@ -291,6 +294,94 @@ class TestProtocolSymbolRate(unittest.TestCase):
         p = clf.guess_protocol(450.0, {"modulation": "PSK (Sayısal-Faz)",
                                        "occupied_bw_hz": 12e3, "symbol_rate_hz": 4800.0})
         self.assertIn("DMR", p)
+
+
+class TestPatternMatchedDF(unittest.TestCase):
+    """ÖLÇÜLEN VNA pattern'iyle pattern-eşleştirmeli DF (şartname 5.1.4). data/antenna_pattern.json
+    yoksa testler dürüstçe atlanır (skip). Örnekler GERÇEK pattern'den üretilir (test-zamanı, ÇALIŞMA
+    ZAMANI DEĞİL) + gürültü -> kerteriz geri kazanımı ve centroid'e üstünlük doğrulanır."""
+
+    @classmethod
+    def setUpClass(cls):
+        from backend.antenna_pattern import shared_pattern
+        cls.ap = shared_pattern()
+        if not cls.ap.available():
+            raise unittest.SkipTest("data/antenna_pattern.json yok — pattern testleri atlandı")
+
+    def _sweep_from_pattern(self, freq_hz, true_bearing, noise_db, rng, step=5.0):
+        ang, pref, fb, pk = self.ap.pattern_at(freq_hz)
+        ae = np.concatenate([ang - 360, ang, ang + 360]); pe = np.concatenate([pref, pref, pref])
+        encs = np.arange(0, 360, step)
+        power = np.interp((true_bearing - encs + pk) % 360, ae, pe) + rng.normal(0, noise_db, len(encs))
+        return encs, power
+
+    def test_pattern_beats_centroid_on_directional_freq(self):
+        rng = np.random.default_rng(1)
+        f = 1575e6                                    # yönlü frekans (ön/arka ~14 dB)
+        perr, cerr = [], []
+        for _ in range(40):
+            tb = rng.uniform(0, 360)
+            encs, power = self._sweep_from_pattern(f, tb, 2.0, rng)
+            m = self.ap.match(encs, power, f)
+            self.assertIsNotNone(m)
+            perr.append(abs(((m["bearing_deg"] - tb + 180) % 360) - 180))
+            est = AmplitudeDFEstimator(use_pattern=False)
+            for e, p in zip(encs, power):
+                est.update(e, p, now=0.0)
+            cb, _, _, _ = est.bearing(now=0.0)
+            cerr.append(abs(((cb - tb + 180) % 360) - 180))
+        prms = float(np.sqrt(np.mean(np.square(perr))))
+        crms = float(np.sqrt(np.mean(np.square(cerr))))
+        self.assertLess(prms, 5.0, f"pattern RMS {prms:.1f}° çok yüksek")
+        self.assertLess(prms, crms, f"pattern ({prms:.1f}°) centroid'i ({crms:.1f}°) geçemedi")
+
+    def test_low_frontback_flagged_not_quality_ok(self):
+        # 915 MHz civarı ön/arka düşük -> quality_ok False olmalı (çağıran σ'yı şişirir/centroid'e düşer)
+        rng = np.random.default_rng(2)
+        encs, power = self._sweep_from_pattern(915e6, 120.0, 2.0, rng)
+        m = self.ap.match(encs, power, 915e6)
+        self.assertIsNotNone(m)
+        self.assertFalse(m["quality_ok"])
+
+    def test_estimator_uses_pattern_when_freq_set(self):
+        rng = np.random.default_rng(3)
+        est = AmplitudeDFEstimator(freq_hz=1900e6)
+        encs, power = self._sweep_from_pattern(1900e6, 47.0, 1.5, rng)
+        for e, p in zip(encs, power):
+            est.update(e, p, now=0.0)
+        b, _, _, _ = est.bearing(now=0.0)
+        self.assertEqual(est._last_method, "pattern")
+        self.assertLess(abs(((b - 47 + 180) % 360) - 180), 5.0)
+        self.assertLess(est.last_sigma(), 8.0)         # pattern σ centroid tabanından küçük
+
+    def test_falls_back_to_centroid_without_freq(self):
+        est = AmplitudeDFEstimator(freq_hz=None)       # frekans yok -> pattern kapalı
+        for az in range(0, 360, 5):
+            d = ((az - 200 + 180) % 360) - 180
+            est.update(az, -90 + 40 * np.cos(np.radians(d)) ** 8 if abs(d) < 90 else -90, now=0.0)
+        b, _, _, _ = est.bearing(now=0.0)
+        self.assertEqual(est._last_method, "centroid")
+        self.assertLess(abs(((b - 200 + 180) % 360) - 180), 5.0)
+
+    def test_weighted_triangulation_downweights_uncertain_node(self):
+        # İki hassas (küçük σ) + bir çok belirsiz/yanlış (büyük σ) kerteriz -> ağırlıklı çözüm
+        # hassaslara yakın olmalı (belirsiz olan konumu bozmamalı).
+        pos = [[0, 0, 0], [500, 0, 0], [250, 400, 0]]
+        # Gerçek hedef (250, 200). İlk iki düğüm doğru bakar, üçüncü 40° yanlış.
+        tgt = np.array([250.0, 200.0, 0.0])
+        dirs, sig = [], []
+        for i, p in enumerate(pos):
+            az, _, _ = bearing_from_positions(p, tgt)
+            if i == 2:
+                az += 40.0; sig.append(30.0)          # yanlış + belirsiz
+            else:
+                sig.append(1.0)                        # hassas
+            dirs.append(azel_to_unit(az, 0.0))
+        x_w, _, _, _ = triangulate_lob(pos, dirs, sigmas=sig)
+        x_u, _, _, _ = triangulate_lob(pos, dirs)      # eşit ağırlık
+        err_w = np.linalg.norm(x_w[:2] - tgt[:2])
+        err_u = np.linalg.norm(x_u[:2] - tgt[:2])
+        self.assertLess(err_w, err_u)                  # ağırlıklı, eşit-ağırlıktan daha isabetli
 
 
 class TestPPIWidget(unittest.TestCase):
