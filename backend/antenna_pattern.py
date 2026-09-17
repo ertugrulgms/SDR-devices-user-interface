@@ -34,10 +34,28 @@ _PATTERN_PATH = os.path.join(_PROJECT_ROOT, "data", "antenna_pattern.json")
 MIN_FRONT_BACK_DB = 10.0
 # Match için ölçülen eğride gereken asgari açı örneği (tek turda ~360°/örnekleme).
 MIN_MATCH_SAMPLES = 8
+# AÇISAL KAPSAMA KAPISI (uzman P0): örnek SAYISI ≠ açısal KAPSAMA. 8 örnek 8°'lik dar bir yayda
+# toplanmışken 360° template araması ill-posed'dir (yanlış kesin kerteriz). Pattern eşleştirmeye
+# ancak yeterli açı gözlendiğinde GÜVEN: ön VE arka bölge görülmeli (front/back ayrımı için ~180°+).
+# Eşik ampiriktir (saha verisiyle kalibre edilecek); altında centroid'e düşülür.
+MIN_COVERAGE_DEG = 180.0
+# AMBIGUITY (uzman P1): en iyi çözümün yanında NEREDEYSE eşit ikinci bir minimum varsa (yan lob /
+# zayıf ön-arka / çok yollu), çözüm belirsizdir. GÜRÜLTÜ-FARKINDA z-skoru: ikincil minimumun birincilden
+# kaç "gürültü-sigma" uzakta olduğu. C_min ≈ n·σ² (gürültünün SSE'si) olduğundan σ²≈C_min/n; maliyet
+# dalgalanma std'i ≈ σ²·√(2n). z = (C_second/C_min − 1)·√(n/2) = ikincil-birincil farkının kaç-sigma'sı.
+# z < eşik -> gürültü ikincili öne geçirebilir (flip riski) -> quality_ok=False -> centroid.
+# (Naif (c2-c1)/(max-min) veya derinlik-oranı metrikleri yüksek yönlülükte iyi frekansları yanlış
+# reddediyordu; z-skoru flip-olasılığına dayanır ve ölçek-bağımsızdır. Eşik ampiriktir, saha kalibreli.)
+MIN_AMBIGUITY_Z = 3.0
+AMBIGUITY_GUARD_DEG = 25.0   # birincil minimum etrafında bu pencere ikincil aramadan hariç
 # sigma tabanı/tavanı (derece): fiziksel olarak hüzme genişliğinden dar bir kerteriz iddia etmeyiz;
-# tavan da güvenilmez eşleşmeyi triangulasyonda otomatik zayıf-ağırlıklı yapar.
+# tavan da güvenilmez eşleşmeyi triangulasyonda otomatik zayıf-ağırlıklı yapar. NOT: 1.5° taban FİZİKSEL
+# olarak KANITLANMIŞ bir alt sınır DEĞİLDİR — gerçek RF yön referanslarıyla ampirik doğrulanmalıdır.
 SIGMA_FLOOR_DEG = 1.5
 SIGMA_CEIL_DEG = 45.0
+# Kalibrasyon frekans-grid adımının bu kadar katına kadar aralık dışına izin ver (kenar toleransı);
+# ötesinde pattern UNAVAILABLE (sessizce uç-noktaya sıçrama YOK — uzman P1 aralık kapısı).
+FREQ_RANGE_MARGIN_STEPS = 0.5
 
 
 class AntennaPattern:
@@ -70,20 +88,58 @@ class AntennaPattern:
     def available(self) -> bool:
         return self._freqs is not None and len(self._freqs) >= 2
 
-    def _freq_index(self, freq_hz: float) -> int:
-        return int(np.argmin(np.abs(self._freqs - float(freq_hz))))
+    def in_range(self, freq_hz: float) -> bool:
+        """Frekans kalibrasyon aralığında mı (kenar toleransı dahil). Dışındaysa pattern kullanılmaz."""
+        if not self.available():
+            return False
+        step = float(self._freqs[1] - self._freqs[0]) if len(self._freqs) > 1 else 20e6
+        margin = FREQ_RANGE_MARGIN_STEPS * step
+        return (self._freqs[0] - margin) <= float(freq_hz) <= (self._freqs[-1] + margin)
 
     def pattern_at(self, freq_hz: float):
-        """İstenen frekansa EN YAKIN ölçülen frekansın pattern eğrisini döner.
-        Dönüş: (angles(A,), pattern_db(A,), front_back_db, peak_angle_deg) veya None (mevcut değil).
-        Not: frekans grid'i 20 MHz; en yakın ölçüm alınır (yayın bant genişliği « 20 MHz olduğundan
-        pattern şekli komşu frekanslarda pratikte aynıdır)."""
-        if not self.available():
+        """İstenen frekansın pattern eğrisini komşu iki kalibre dilim arasında LİNEER (güç alanında)
+        İNTERPOLE ederek döner. Aralık DIŞINDAysa None (uç-noktaya sessizce sıçramaz — uzman P1).
+        Dönüş: (angles(A,), pattern_db(A,), front_back_db, peak_angle_deg) veya None.
+        İnterpolasyon güç (doğrusal) alanında yapılıp tekrar tepeye normalize edilir; fb ve pk
+        interpolasyon SONUCU eğriden yeniden hesaplanır (tutarlılık)."""
+        if not self.available() or not self.in_range(freq_hz):
             return None
-        i = self._freq_index(freq_hz)
-        fb = float(self._front_back[i]) if len(self._front_back) > i else 0.0
-        pk = float(self._peak_angle[i]) if len(self._peak_angle) > i else 0.0
-        return self._angles.copy(), self._pattern[i].copy(), fb, pk
+        f = float(freq_hz)
+        fr = self._freqs
+        # Bracketing iki dilim + ağırlık
+        if f <= fr[0]:
+            i0 = i1 = 0; w = 0.0
+        elif f >= fr[-1]:
+            i0 = i1 = len(fr) - 1; w = 0.0
+        else:
+            i1 = int(np.searchsorted(fr, f))
+            i0 = i1 - 1
+            w = (f - fr[i0]) / (fr[i1] - fr[i0] + 1e-12)     # 0 -> i0, 1 -> i1
+        # dB pattern -> doğrusal güç -> ağırlıklı ortalama -> dB -> tepeye normalize
+        p0 = np.power(10.0, self._pattern[i0] / 10.0)
+        p1 = np.power(10.0, self._pattern[i1] / 10.0)
+        lin = (1.0 - w) * p0 + w * p1
+        db = 10.0 * np.log10(lin + 1e-12)
+        db = db - db.max()
+        ang = self._angles
+        ipk = int(np.argmax(db))
+        pk = float(ang[ipk])
+        back = (pk + 180.0) % 360.0
+        iback = int(np.argmin(np.abs(((ang - back + 180.0) % 360.0) - 180.0)))
+        fb = float(db[ipk] - db[iback])
+        return ang.copy(), db, fb, pk
+
+    @staticmethod
+    def coverage_deg(az_deg) -> float:
+        """Örneklerin açısal KAPSAMASI (derece): 360 − en büyük dairesel boşluk. Tam turda ~360,
+        dar yayda küçük. Pattern eşleştirmenin güvenilir olması için (ön+arka görülmeli) gerekir."""
+        a = np.sort(np.asarray(az_deg, dtype=float) % 360.0)
+        if len(a) < 2:
+            return 0.0
+        gaps = np.diff(a)
+        wrap = (a[0] + 360.0) - a[-1]                          # son -> ilk (dairesel) boşluk
+        largest = float(max(gaps.max(), wrap))
+        return float(max(0.0, 360.0 - largest))
 
     def match(self, meas_az_deg, meas_power_db, freq_hz):
         """PATTERN EŞLEŞTİRME: ölçülen (azimut, güç) örneklerini frekansın kalibre pattern'ine oturtur.
@@ -92,13 +148,23 @@ class AntennaPattern:
         φ_peak'te olduğundan boresight-çerçevesi P_ref((x + φ_peak) mod 360). Her iki eğri de kendi
         tepesine normalize edilerek mutlak güç (kaynak gücü/mesafe) elenir. Maliyet:
             C(β) = Σ_i [ Pmeas_norm(θ_i) - Pref_bore(β - θ_i) ]²
-        β* = argmin C. Tepe civarı parabol uydurup Fisher bilgisiyle sigma:  σ_β ≈ sqrt( (C_min/(n-1)) / a )
-        (a = parabol eğrilik katsayısı, C≈C_min + a(β-β*)²).
+        β* = argmin C. Tepe civarı parabol uydurulup alt-derece β + belirsizlik (σ) kestirilir.
 
-        Girdi: meas_az_deg (list/array derece), meas_power_db (list/array dB, mutlak seviye önemsiz),
-               freq_hz.
-        Dönüş: dict {bearing_deg, sigma_deg, quality_ok(bool), n, front_back_db, cost_min} veya None.
-        quality_ok=False ise (az örnek / düşük ön-arka / bozuk eşleşme) çağıran centroid'e düşmeli.
+        SİGMA: σ_β ≈ sqrt( (C_min/(n-1)) / a ), a = parabol eğrilik katsayısı. Bu, maliyet eğrisinin
+        yerel EĞRİLİĞİNDEN türetilen bir belirsizlik KESTİRİMİDİR (Gauss-gürültü/Fisher yorumu ancak
+        gerçek gürültü modeli + yön referanslarıyla AMPİRİK doğrulanırsa savunulabilir). Şu an
+        heuristic'tir; SIGMA_FLOOR_DEG fiziksel bir alt sınır garantisi DEĞİLDİR.
+
+        KALİTE KAPILARI (quality_ok True olması için hepsi gerekir):
+          - frekans kalibrasyon aralığında (pattern_at None dönmemeli),
+          - açısal kapsama >= MIN_COVERAGE_DEG (dar yayda template araması ill-posed),
+          - ön/arka >= MIN_FRONT_BACK_DB (anten o frekansta yeterince yönlü),
+          - AMBIGUITY: ikincil minimum birincilden yeterince kötü (yan-lob/çok-yollu belirsizliği yok),
+          - parabol eğriliği pozitif ve σ tavana takılı değil.
+        quality_ok=False ise çağıran (DF motoru) centroid'e DÜŞER (uzman P0: gerçek fallback).
+
+        Dönüş: dict {bearing_deg, sigma_deg, quality_ok, n, coverage_deg, front_back_db, cost_min,
+        ambiguity_z} veya None (pattern yok / frekans aralık dışı / yetersiz örnek).
         """
         if not self.available():
             return None
@@ -107,7 +173,11 @@ class AntennaPattern:
         n = len(az)
         if n < MIN_MATCH_SAMPLES or n != len(pm):
             return None
-        ang, pref, fb, pk = self.pattern_at(freq_hz)
+        got = self.pattern_at(freq_hz)
+        if got is None:                                        # frekans kalibrasyon aralığı dışında
+            return None
+        ang, pref, fb, pk = got
+        cov = self.coverage_deg(az)
         pm = pm - np.max(pm)                                   # ölçüleni tepeye normalize (pref zaten normalize)
         # Boresight-çerçevesi referans: fonksiyon x(derece) -> dB, dairesel interpolasyonla.
         ang_ext = np.concatenate([ang - 360.0, ang, ang + 360.0])
@@ -126,6 +196,16 @@ class AntennaPattern:
         beta = float(betas[kmin])
         cmin = float(cost[kmin])
 
+        # AMBIGUITY: birincil minimum etrafındaki ±guard penceresini hariç tut, DIŞARIDAKİ en iyi
+        # (ikincil) maliyeti bul. Belirsizlik = ikincil minimumun DERİNLİĞİ / birincilin derinliği
+        # (medyan maliyete göre; ölçek-bağımsız, yönlülüğe yansız).
+        guard = int(round(AMBIGUITY_GUARD_DEG))
+        offs = np.abs(((np.arange(len(betas)) - kmin + len(betas) // 2) % len(betas)) - len(betas) // 2)
+        outside = offs > guard
+        second = float(np.min(cost[outside])) if np.any(outside) else float(cost.max())
+        # Gürültü-farkında ayrışma z-skoru (büyük=net tek çözüm, küçük=flip riski)
+        ambiguity_z = (second / max(cmin, 1e-9) - 1.0) * np.sqrt(n / 2.0)
+
         # Tepe civarı 3 nokta ile parabol -> hassas β + eğrilik a
         k0, k1, k2 = (kmin - 1) % len(betas), kmin, (kmin + 1) % len(betas)
         c0, c1, c2 = cost[k0], cost[k1], cost[k2]
@@ -138,14 +218,18 @@ class AntennaPattern:
             sigma = SIGMA_CEIL_DEG
         sigma = float(np.clip(sigma, SIGMA_FLOOR_DEG, SIGMA_CEIL_DEG))
 
-        quality_ok = (fb >= MIN_FRONT_BACK_DB) and (a > 1e-9) and (sigma < SIGMA_CEIL_DEG)
+        quality_ok = ((fb >= MIN_FRONT_BACK_DB) and (cov >= MIN_COVERAGE_DEG)
+                      and (ambiguity_z >= MIN_AMBIGUITY_Z) and (a > 1e-9)
+                      and (sigma < SIGMA_CEIL_DEG))
         return {
             "bearing_deg": round(beta, 2),
             "sigma_deg": round(sigma, 2),
             "quality_ok": bool(quality_ok),
             "n": n,
+            "coverage_deg": round(cov, 1),
             "front_back_db": round(fb, 1),
             "cost_min": round(cmin, 4),
+            "ambiguity_z": round(ambiguity_z, 2),
         }
 
 

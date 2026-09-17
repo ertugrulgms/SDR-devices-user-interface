@@ -383,6 +383,99 @@ class TestPatternMatchedDF(unittest.TestCase):
         err_u = np.linalg.norm(x_u[:2] - tgt[:2])
         self.assertLess(err_w, err_u)                  # ağırlıklı, eşit-ağırlıktan daha isabetli
 
+    # --- UZMAN İNCELEMESİYLE EKLENEN KAPI/DAYANIKLILIK TESTLERİ ---------------------------
+    def test_circular_boundary_bearings(self):
+        # 0°/359° dolanma sınırında kerteriz doğru geri kazanılmalı
+        rng = np.random.default_rng(10)
+        for tb in (0.0, 1.0, 179.0, 180.0, 181.0, 359.0):
+            encs, power = self._sweep_from_pattern(1575e6, tb, 1.0, rng)
+            m = self.ap.match(encs, power, 1575e6)
+            self.assertIsNotNone(m)
+            err = abs(((m["bearing_deg"] - tb + 180) % 360) - 180)
+            self.assertLess(err, 5.0, f"tb={tb} -> {m['bearing_deg']} (hata {err:.1f}°)")
+
+    def test_incomplete_sweep_low_coverage_not_quality_ok(self):
+        # Sadece dar bir yay (~85°) tarandıysa pattern eşleştirme GÜVENİLMEZ -> quality_ok False
+        rng = np.random.default_rng(11)
+        ang, pref, fb, pk = self.ap.pattern_at(1575e6)
+        ae = np.concatenate([ang - 360, ang, ang + 360]); pe = np.concatenate([pref, pref, pref])
+        encs = np.arange(100, 185, 5.0)                # ~85° yay
+        power = np.interp((140.0 - encs + pk) % 360, ae, pe) + rng.normal(0, 1.0, len(encs))
+        m = self.ap.match(encs, power, 1575e6)
+        self.assertIsNotNone(m)
+        self.assertLess(m["coverage_deg"], 180.0)
+        self.assertFalse(m["quality_ok"])              # kapsama yetersiz -> güvenilmez
+
+    def test_estimator_falls_back_to_centroid_on_partial_sweep(self):
+        # Dar yayda estimator pattern'i KULLANMAMALI, centroid'e düşmeli (gerçek fallback — P0)
+        est = AmplitudeDFEstimator(freq_hz=1575e6)
+        rng = np.random.default_rng(12)
+        ang, pref, fb, pk = self.ap.pattern_at(1575e6)
+        ae = np.concatenate([ang - 360, ang, ang + 360]); pe = np.concatenate([pref, pref, pref])
+        for az in np.arange(100, 185, 5.0):
+            p = float(np.interp((140.0 - az + pk) % 360, ae, pe)) + rng.normal(0, 1.0)
+            est.update(az, p, now=0.0)
+        est.bearing(now=0.0)
+        self.assertIn("centroid", est.last_method())   # pattern DEĞİL
+        self.assertGreater(est.last_coverage(), 0.0)
+
+    def test_out_of_range_frequency_rejected(self):
+        # Kalibrasyon aralığı (300 MHz–3 GHz) dışında pattern KULLANILMAMALI (uç-noktaya sıçrama yok)
+        self.assertFalse(self.ap.in_range(150e6))
+        self.assertFalse(self.ap.in_range(4000e6))
+        self.assertIsNone(self.ap.pattern_at(150e6))
+        rng = np.random.default_rng(13)
+        # 1575 MHz sweep'ini 150 MHz frekansla eşleştirmeye çalış -> None (aralık dışı)
+        encs, power = self._sweep_from_pattern(1575e6, 47.0, 1.0, rng)
+        self.assertIsNone(self.ap.match(encs, power, 150e6))
+
+    def test_frequency_interpolation_between_slices(self):
+        # İki kalibre dilim arasındaki frekans, ikisinin GÜÇ-ortalamasına yakın bir pattern vermeli
+        f = np.array(self.ap._freqs)
+        i = len(f) // 2
+        f_mid = float((f[i] + f[i + 1]) / 2.0)
+        _, p_mid, _, _ = self.ap.pattern_at(f_mid)
+        _, p0, _, _ = self.ap.pattern_at(float(f[i]))
+        _, p1, _, _ = self.ap.pattern_at(float(f[i + 1]))
+        # güç alanında ortalama (normalize öncesi kabaca); interpolasyon iki uç ARASINDA olmalı
+        lin_mid = 10 ** (p_mid / 10); lin0 = 10 ** (p0 / 10); lin1 = 10 ** (p1 / 10)
+        expected = 0.5 * (lin0 + lin1); expected /= expected.max()
+        self.assertLess(float(np.mean(np.abs(lin_mid - expected))), 0.05)
+
+    def test_power_scaling_invariance(self):
+        # Ölçülen eğri mutlak seviyede ×10 / ÷10 ölçeklenirse (kaynak gücü/mesafe) kerteriz DEĞİŞMEMELİ
+        rng = np.random.default_rng(14)
+        encs, power = self._sweep_from_pattern(2400e6, 88.0, 1.0, rng)
+        b_ref = self.ap.match(encs, power, 2400e6)["bearing_deg"]
+        for shift_db in (-20.0, +20.0):                # dB toplamı = doğrusal ×0.01 / ×100
+            b = self.ap.match(encs, power + shift_db, 2400e6)["bearing_deg"]
+            self.assertLess(abs(((b - b_ref + 180) % 360) - 180), 0.5)
+
+    def test_main_aux_matcher_parity(self):
+        # Merkez (backend) ve AUX (bağımsız kopya) AYNI girdide AYNI sonucu vermeli (bakım riski kapısı)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("aux_station_mod",
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aux_station.py"))
+        aux = importlib.util.module_from_spec(spec)
+        sys.modules["aux_station_mod"] = aux
+        try:
+            spec.loader.exec_module(aux)
+        except SystemExit:
+            pass
+        auxpat = aux._aux_pattern()
+        if not auxpat.available():
+            self.skipTest("aux pattern yüklenemedi")
+        rng = np.random.default_rng(15)
+        for f in (1575e6, 1900e6, 2400e6):
+            encs, power = self._sweep_from_pattern(f, 123.0, 1.5, rng)
+            mb = self.ap.match(encs, power, f)
+            ma = auxpat.match(encs, power, f)
+            self.assertIsNotNone(mb); self.assertIsNotNone(ma)
+            self.assertAlmostEqual(mb["bearing_deg"], ma["bearing_deg"], places=2,
+                                   msg=f"{f/1e6:.0f} MHz: merkez≠aux bearing")
+            self.assertAlmostEqual(mb["sigma_deg"], ma["sigma_deg"], places=2)
+            self.assertEqual(mb["quality_ok"], ma["quality_ok"])
+
 
 class TestPPIWidget(unittest.TestCase):
     def test_ppi_updates_and_resets(self):

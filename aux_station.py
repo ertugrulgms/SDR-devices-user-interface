@@ -91,17 +91,23 @@ import pyqtgraph as pg
 #     antenna_pattern.json aux_station.py'nin YANINDA (veya data/ altında) varsa pattern-eşleştirmeli
 #     DF açılır (kerteriz + σ çok daha hassas); yoksa sessizce centroid'e düşer. σ merkeze gönderilip
 #     ağırlıklı üçgenlemede kullanılır.
+# Bu sabitler merkezdeki backend/antenna_pattern.py ile AYNI olmalı (parity testiyle doğrulanır).
 _AUX_SIGMA_CENTROID = 8.0
 _AUX_SIGMA_CEIL = 45.0
 _AUX_SIGMA_FLOOR = 1.5
-_AUX_SIGMA_LOWQ = 4.0
 _AUX_MIN_FB_DB = 10.0
 _AUX_MIN_SAMPLES = 8
+_AUX_MIN_COVERAGE_DEG = 180.0
+_AUX_MIN_AMBIG_Z = 3.0
+_AUX_AMBIG_GUARD_DEG = 25.0
+_AUX_FREQ_MARGIN_STEPS = 0.5
 
 
 class _AuxPattern:
     """antenna_pattern.json yükleyip pattern-eşleştirme (template matching) yapar. available()=False
-    ise merkezdeki mantıkla birebir aynı şekilde centroid'e düşülür. ASLA sentetik veri üretmez."""
+    ise merkezdeki mantıkla birebir aynı şekilde centroid'e düşülür. ASLA sentetik veri üretmez.
+    ALGORİTMA merkezdeki backend.antenna_pattern.AntennaPattern ile birebir aynıdır (parity testi
+    tests/test_direction_finding.py'de ikisini aynı girdiyle karşılaştırır)."""
 
     def __init__(self):
         self._ok = False
@@ -114,9 +120,6 @@ class _AuxPattern:
                 self._freqs = np.asarray(d["freqs_hz"], float)
                 self._angles = np.asarray(d["angles_deg"], float)
                 self._pat = np.asarray(d["pattern_db"], float)
-                q = d.get("quality", {})
-                self._fb = np.asarray(q.get("front_back_db", []), float)
-                self._pk = np.asarray(q.get("peak_angle_deg", []), float)
                 if self._pat.shape == (len(self._freqs), len(self._angles)) and len(self._freqs) >= 2:
                     self._ok = True
                     break
@@ -126,9 +129,43 @@ class _AuxPattern:
     def available(self):
         return self._ok
 
+    def in_range(self, freq_hz):
+        if not self._ok:
+            return False
+        step = float(self._freqs[1] - self._freqs[0]) if len(self._freqs) > 1 else 20e6
+        m = _AUX_FREQ_MARGIN_STEPS * step
+        return (self._freqs[0] - m) <= float(freq_hz) <= (self._freqs[-1] + m)
+
+    def pattern_at(self, freq_hz):
+        """Komşu iki dilim arasında GÜÇ alanında lineer interpolasyon; aralık dışı -> None."""
+        if not self._ok or not self.in_range(freq_hz):
+            return None
+        f = float(freq_hz); fr = self._freqs
+        if f <= fr[0]:
+            i0 = i1 = 0; w = 0.0
+        elif f >= fr[-1]:
+            i0 = i1 = len(fr) - 1; w = 0.0
+        else:
+            i1 = int(np.searchsorted(fr, f)); i0 = i1 - 1
+            w = (f - fr[i0]) / (fr[i1] - fr[i0] + 1e-12)
+        lin = (1.0 - w) * np.power(10.0, self._pat[i0] / 10.0) + w * np.power(10.0, self._pat[i1] / 10.0)
+        db = 10.0 * np.log10(lin + 1e-12); db = db - db.max()
+        ang = self._angles; ipk = int(np.argmax(db)); pk = float(ang[ipk])
+        back = (pk + 180.0) % 360.0
+        iback = int(np.argmin(np.abs(((ang - back + 180.0) % 360.0) - 180.0)))
+        return ang, db, float(db[ipk] - db[iback]), pk
+
+    @staticmethod
+    def coverage_deg(az):
+        a = np.sort(np.asarray(az, float) % 360.0)
+        if len(a) < 2:
+            return 0.0
+        return float(max(0.0, 360.0 - max(float(np.diff(a).max()), (a[0] + 360.0) - a[-1])))
+
     def match(self, az_deg, power_db, freq_hz):
         """(az, güç) örneklerini frekansın kalibre pattern'ine oturtur -> {bearing_deg, sigma_deg,
-        quality_ok, ...} veya None. Merkezdeki backend.antenna_pattern.match ile aynı algoritma."""
+        quality_ok, coverage_deg, front_back_db, ambiguity_z, ...} veya None. Merkezle aynı algoritma:
+        interpolasyon + aralık kapısı + açısal kapsama + ambiguity + parabolik σ."""
         if not self._ok:
             return None
         az = np.asarray(az_deg, float) % 360.0
@@ -136,10 +173,11 @@ class _AuxPattern:
         n = len(az)
         if n < _AUX_MIN_SAMPLES or n != len(pm):
             return None
-        i = int(np.argmin(np.abs(self._freqs - float(freq_hz))))
-        ang = self._angles; pref = self._pat[i]
-        fb = float(self._fb[i]) if len(self._fb) > i else 0.0
-        pk = float(self._pk[i]) if len(self._pk) > i else 0.0
+        got = self.pattern_at(freq_hz)
+        if got is None:
+            return None
+        ang, pref, fb, pk = got
+        cov = self.coverage_deg(az)
         pm = pm - np.max(pm)
         ae = np.concatenate([ang - 360.0, ang, ang + 360.0])
         pe = np.concatenate([pref, pref, pref])
@@ -150,6 +188,10 @@ class _AuxPattern:
         betas = np.arange(0.0, 360.0, 1.0)
         cost = np.array([float(np.dot(pm - pref_bore(b - az), pm - pref_bore(b - az))) for b in betas])
         kmin = int(np.argmin(cost)); beta = float(betas[kmin]); cmin = float(cost[kmin])
+        guard = int(round(_AUX_AMBIG_GUARD_DEG))
+        offs = np.abs(((np.arange(len(betas)) - kmin + len(betas) // 2) % len(betas)) - len(betas) // 2)
+        second = float(np.min(cost[offs > guard])) if np.any(offs > guard) else float(cost.max())
+        ambiguity_z = (second / max(cmin, 1e-9) - 1.0) * np.sqrt(n / 2.0)
         c0, c1, c2 = cost[(kmin - 1) % len(betas)], cost[kmin], cost[(kmin + 1) % len(betas)]
         a = 0.5 * (c0 + c2 - 2.0 * c1)
         if a > 1e-9:
@@ -158,9 +200,12 @@ class _AuxPattern:
         else:
             sigma = _AUX_SIGMA_CEIL
         sigma = float(np.clip(sigma, _AUX_SIGMA_FLOOR, _AUX_SIGMA_CEIL))
-        quality_ok = (fb >= _AUX_MIN_FB_DB) and (a > 1e-9) and (sigma < _AUX_SIGMA_CEIL)
+        quality_ok = ((fb >= _AUX_MIN_FB_DB) and (cov >= _AUX_MIN_COVERAGE_DEG)
+                      and (ambiguity_z >= _AUX_MIN_AMBIG_Z) and (a > 1e-9)
+                      and (sigma < _AUX_SIGMA_CEIL))
         return {"bearing_deg": round(beta, 2), "sigma_deg": round(sigma, 2),
-                "quality_ok": bool(quality_ok), "n": n, "front_back_db": round(fb, 1)}
+                "quality_ok": bool(quality_ok), "n": n, "coverage_deg": round(cov, 1),
+                "front_back_db": round(fb, 1), "ambiguity_z": round(ambiguity_z, 2)}
 
 
 _AUX_PATTERN = None
@@ -230,15 +275,18 @@ class AmplitudeDF:
         bearing = (peak_az + centroid) % 360.0
         conf = float(min(1.0, max(0.0, (peak_amp - floor) / 20.0)))
         # PATTERN EŞLEŞTİRME ile RAFİNE (merkezle aynı): frekans + pattern varsa tüm eğriyi oturt.
+        # KALİTE KAPISI (gerçek fallback): pattern yalnızca quality_ok ise kullanılır; aksi halde
+        # centroid kerterizi korunur (bearing atılmaz-sadece-σ-şişir DEĞİL).
         if self._pattern is not None and self.freq_hz:
             m = self._pattern.match(azs, amps, self.freq_hz)
             if m is not None:
-                bearing = m["bearing_deg"]
-                sigma = m["sigma_deg"]
-                if not m["quality_ok"]:
-                    sigma = min(_AUX_SIGMA_CEIL, sigma * _AUX_SIGMA_LOWQ)
-                self._last_sigma = sigma
-                self._last_method = "pattern"
+                if m["quality_ok"]:
+                    bearing = m["bearing_deg"]
+                    self._last_sigma = m["sigma_deg"]
+                    self._last_method = "pattern"
+                else:
+                    self._last_sigma = min(_AUX_SIGMA_CEIL, _AUX_SIGMA_CENTROID * 1.5)
+                    self._last_method = "centroid(pattern-düşük-kalite)"
         return round(bearing, 2), round(peak_amp, 1), round(conf, 2), len(self._bins)
 
 

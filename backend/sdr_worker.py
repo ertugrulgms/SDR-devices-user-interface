@@ -949,6 +949,10 @@ class SDRWorker(QThread):
             "df_rms_deg": df_rms_deg,
             "df_reference_deg": self.df_tracker.reference_deg,
             "df_sample_count": self.df_tracker.sample_count(),
+            # YEREL KERTERİZ TEŞHİSİ (jüri/operatör): yöntem (pattern/centroid), belirsizlik, kapsama.
+            "self_df_method": self.self_amp_df.last_method(),
+            "self_df_sigma_deg": round(self.self_amp_df.last_sigma(), 2),
+            "self_df_coverage_deg": round(self.self_amp_df.last_coverage(), 1),
         }
 
     def _refine_fm_fsk(self, snap):

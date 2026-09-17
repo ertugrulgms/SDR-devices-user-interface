@@ -49,7 +49,7 @@ class PPIWidget(QWidget):
         self.plot.setMinimumSize(180, 180)             # sıkışabilir minimum; pencere ekrana sığsın
         layout.addWidget(self.plot)
 
-        self._max_range_m = 1000.0
+        self._max_range_m = 2000.0     # varsayılan menzil: halkalar 500/1000/1500/2000 m (saha ~2 km)
         self._draw_static()
 
         # Hedef blip (kaynak konumu)
@@ -146,7 +146,9 @@ class PPIWidget(QWidget):
             p = np.array(r.get("pos", [0.0, 0.0, 0.0]), float) - self_pos
             dists.append(float(np.hypot(p[0], p[1])))
         need = max(dists) if dists else 0.0
-        target_scale = max(200.0, need * 1.2)
+        # Taban 2000 m: radar normalde hep 0/500/1000/1500/2000 gösterir; hedef/düğüm 2000 m'yi
+        # aşarsa ölçek büyür (uzak hedef kırpılmaz), altında sabit 2000 m kalır.
+        target_scale = max(2000.0, need * 1.2)
         # Halkaları yalnızca %25+ değişince yeniden çiz (titremeyi önle)
         if abs(target_scale - self._max_range_m) / max(self._max_range_m, 1e-9) > 0.25:
             self._max_range_m = round(target_scale, -1)

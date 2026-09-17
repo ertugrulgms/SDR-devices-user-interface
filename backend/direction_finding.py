@@ -63,9 +63,6 @@ MAX_RESIDUAL_FLOOR_M = 30.0      # yakın hedefte mutlak alt taban (oran çok k�
 # Kerteriz belirsizliği (σ, derece) — ağırlıklı üçgenlemede 1/σ² ağırlığı verir.
 # CENTROID yöntemi hüzme genişliğiyle sınırlı, kabaca ±birkaç derece: muhafazakâr sabit taban.
 SIGMA_CENTROID_DEG = 8.0
-# Pattern eşleşse de ön/arka oranı düşükse (belirsiz, 180° flip riski) σ bu katsayıyla şişirilir:
-# bearing atılmaz ama üçgenlemede düşük ağırlık alır; flip olursa forward-ray/residual kapıları eler.
-SIGMA_LOWQ_PENALTY = 4.0
 from backend.antenna_pattern import SIGMA_CEIL_DEG   # σ tavanı (pattern modülüyle ortak)
 
 
@@ -190,7 +187,8 @@ class AmplitudeDFEstimator:
                 self._pattern = None
 
         self._last_sigma = SIGMA_CENTROID_DEG   # son bearing()'in belirsizliği (derece) — ağırlıklı üçgenleme için
-        self._last_method = "centroid"          # "pattern" | "centroid" (teşhis / arayüz)
+        self._last_method = "centroid"          # "pattern" | "centroid" | ... (teşhis / arayüz)
+        self._last_coverage = 0.0               # son taramanın açısal kapsaması (derece) — teşhis
 
     def reset(self):
         self._bins.clear()
@@ -202,6 +200,14 @@ class AmplitudeDFEstimator:
     def last_sigma(self) -> float:
         """Son bearing() çağrısının kerteriz belirsizliği (derece). Üçgenlemede 1/σ² ağırlık için."""
         return self._last_sigma
+
+    def last_method(self) -> str:
+        """Son kerterizin yöntemi ('pattern' / 'centroid' ...) — teşhis/arayüz için."""
+        return self._last_method
+
+    def last_coverage(self) -> float:
+        """Son taramanın açısal kapsaması (derece) — teşhis/arayüz için."""
+        return self._last_coverage
 
     def update(self, azimuth_deg: float, amp_dbm: float, now: float = None):
         now = time.time() if now is None else now
@@ -244,17 +250,24 @@ class AmplitudeDFEstimator:
         conf = float(min(1.0, max(0.0, (peak_amp - floor) / 20.0)))
 
         # PATTERN EŞLEŞTİRME ile RAFİNE (şartname 5.1.4): ölçülen VNA pattern'i + frekans varsa,
-        # tüm eğriyi kalibre pattern'e oturtarak çok daha hassas kerteriz + σ elde et. Başarısız
-        # (az örnek / frekans yok / pattern yok) ise centroid sonucunu koru.
+        # tüm eğriyi kalibre pattern'e oturtarak çok daha hassas kerteriz + σ elde et.
+        # KALİTE KAPISI (uzman P0 — GERÇEK fallback): pattern yalnızca quality_ok ise KULLANILIR
+        # (frekans aralıkta + açısal kapsama yeterli + ön/arka yüksek + ambiguity düşük). Aksi halde
+        # centroid kerterizi KORUNUR (pattern bearing atılır, σ şişirmekle yetinilmez). Frekans/pattern
+        # yoksa da centroid.
         if self._pattern is not None and self.freq_hz:
             m = self._pattern.match(azs, amps, self.freq_hz)
             if m is not None:
-                bearing_deg = m["bearing_deg"]
-                sigma = m["sigma_deg"]
-                if not m["quality_ok"]:
-                    sigma = min(SIGMA_CEIL_DEG, sigma * SIGMA_LOWQ_PENALTY)  # düşük ön/arka -> düşük ağırlık
-                self._last_sigma = sigma
-                self._last_method = "pattern"
+                self._last_coverage = m.get("coverage_deg", 0.0)
+                if m["quality_ok"]:
+                    bearing_deg = m["bearing_deg"]
+                    self._last_sigma = m["sigma_deg"]
+                    self._last_method = "pattern"
+                else:
+                    # Pattern güvenilmez -> CENTROID kerterizi kullan (yukarıda hesaplandı). σ, pattern'in
+                    # düşük güvenini yansıtacak şekilde centroid tabanının biraz üstünde tutulur.
+                    self._last_sigma = min(SIGMA_CEIL_DEG, SIGMA_CENTROID_DEG * 1.5)
+                    self._last_method = "centroid(pattern-düşük-kalite)"
         return round(bearing_deg, 2), round(peak_amp, 1), round(conf, 2), len(self._bins)
 
 
