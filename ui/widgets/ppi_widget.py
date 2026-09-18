@@ -6,10 +6,19 @@ konumları ve her düğümün kerteriz (LOB) ışını çizilir (üçgenleme geo
 
 PPI ekseni: ekran x = Doğu, y = Kuzey (yukarı). Azimut Kuzey'den saat yönü -> x=r·sin(az), y=r·cos(az).
 """
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
-from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QGraphicsPolygonItem
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import QPolygonF, QColor, QBrush, QPen
 import numpy as np
 import pyqtgraph as pg
+
+# KERTERİZ DİLİMİ (wedge): kerteriz ince çizgi yerine silik saydam yeşil DAR PASTA DİLİMİ olarak
+# çizilir -> hem daha görünür hem belirsizliği (σ) gösterir. Yarım-açı σ'dan türetilir, görünürlük
+# için bir taban/tavana kırpılır. Renk sabit yeşil (düğüm renginden bağımsız — "kerteriz konisi").
+WEDGE_HALF_MIN_DEG = 3.0
+WEDGE_HALF_MAX_DEG = 12.0
+WEDGE_FILL = QColor(0, 230, 120, 46)     # silik saydam yeşil (alpha 46/255)
+WEDGE_EDGE = QColor(0, 230, 120, 90)
 
 
 class PPIWidget(QWidget):
@@ -21,6 +30,7 @@ class PPIWidget(QWidget):
         self._ring_labels = []
         self._node_rays = []
         self._node_markers = []
+        self._node_wedges = []      # kerteriz pasta dilimleri (QGraphicsPolygonItem)
         self.init_ui()
 
     def init_ui(self):
@@ -49,7 +59,7 @@ class PPIWidget(QWidget):
         self.plot.setMinimumSize(180, 180)             # sıkışabilir minimum; pencere ekrana sığsın
         layout.addWidget(self.plot)
 
-        self._max_range_m = 2000.0     # varsayılan menzil: halkalar 500/1000/1500/2000 m (saha ~2 km)
+        self._max_range_m = 200.0      # varsayılan menzil: halkalar 50/100/150/200 m (saha ~100×200 m)
         self._draw_static()
 
         # Hedef blip (kaynak konumu)
@@ -115,6 +125,22 @@ class PPIWidget(QWidget):
         a = np.radians(az_deg)
         return r * np.sin(a), r * np.cos(a)
 
+    def _make_bearing_wedge(self, px, py, bearing_deg, half_deg, r):
+        """Kerteriz belirsizlik dilimi: tepe (px,py) düğümde, bearing±half_deg arası yay r'ye kadar.
+        Silik saydam yeşil dolgu (QGraphicsPolygonItem, ENU-metre koordinatında). Radyal çizgilerin
+        ALTINDA kalsın diye düşük z. Yay birkaç noktayla kavisli çizilir."""
+        poly = QPolygonF()
+        poly.append(QPointF(px, py))                       # tepe = düğüm konumu
+        for a in np.linspace(bearing_deg - half_deg, bearing_deg + half_deg, 8):
+            dx, dy = self._azr_to_xy(float(a), r)
+            poly.append(QPointF(px + dx, py + dy))
+        poly.append(QPointF(px, py))                       # kapat
+        item = QGraphicsPolygonItem(poly)
+        item.setBrush(QBrush(WEDGE_FILL))
+        item.setPen(QPen(WEDGE_EDGE, 0))                   # ince kenar (0 = kozmetik/1px)
+        item.setZValue(-20)                                # halkaların/çizgilerin altında
+        return item
+
     def update_ppi(self, payload):
         """Worker payload'ından PPI'yı günceller: düğüm konumları/kerterizleri + hedef blip."""
         # CANLI ANTEN YÖN ÇİZGİSİ (ham enkoder açısı) — antenle birlikte akıcı döner. Kerterizden
@@ -146,9 +172,9 @@ class PPIWidget(QWidget):
             p = np.array(r.get("pos", [0.0, 0.0, 0.0]), float) - self_pos
             dists.append(float(np.hypot(p[0], p[1])))
         need = max(dists) if dists else 0.0
-        # Taban 2000 m: radar normalde hep 0/500/1000/1500/2000 gösterir; hedef/düğüm 2000 m'yi
-        # aşarsa ölçek büyür (uzak hedef kırpılmaz), altında sabit 2000 m kalır.
-        target_scale = max(2000.0, need * 1.2)
+        # Taban 200 m: radar normalde hep 0/50/100/150/200 m gösterir (yarışma alanı ~100×200 m);
+        # hedef/düğüm 200 m'yi aşarsa ölçek büyür (uzak hedef kırpılmaz), altında sabit 200 m kalır.
+        target_scale = max(200.0, need * 1.2)
         # Halkaları yalnızca %25+ değişince yeniden çiz (titremeyi önle)
         if abs(target_scale - self._max_range_m) / max(self._max_range_m, 1e-9) > 0.25:
             self._max_range_m = round(target_scale, -1)
@@ -159,6 +185,11 @@ class PPIWidget(QWidget):
             self.plot.removeItem(it)
         self._node_rays.clear()
         self._node_markers.clear()
+        # Eski kerteriz dilimlerini temizle (ViewBox'tan)
+        vb = self.plot.getViewBox()
+        for w in self._node_wedges:
+            vb.removeItem(w)
+        self._node_wedges.clear()
 
         # Düğümleri ve kerteriz (LOB) ışınlarını çiz
         for i, (nid, r) in enumerate(nodes.items()):
@@ -169,8 +200,14 @@ class PPIWidget(QWidget):
             mk = pg.ScatterPlotItem([p[0]], [p[1]], size=11, symbol='t',
                                     pen=pg.mkPen('#ffffff', width=1), brush=pg.mkBrush(color))
             self.plot.addItem(mk); self._node_markers.append(mk)
-            # Kerteriz ışını: düğüm konumundan azimut yönünde
+            # KERTERİZ: silik saydam yeşil PASTA DİLİMİ (belirsizlik konisi) + ince merkez çizgisi.
             az = r.get("azimuth_deg", 0.0)
+            sigma = float(r.get("sigma_deg", 0.0) or 0.0)
+            half = float(np.clip(sigma if sigma > 0 else WEDGE_HALF_MIN_DEG,
+                                 WEDGE_HALF_MIN_DEG, WEDGE_HALF_MAX_DEG))
+            wedge = self._make_bearing_wedge(p[0], p[1], az, half, self._max_range_m)
+            vb.addItem(wedge, ignoreBounds=True); self._node_wedges.append(wedge)
+            # İnce merkez çizgisi (kesin kerteriz yönü, düğüm renginde — düğümü tanımak için)
             dx, dy = self._azr_to_xy(az, self._max_range_m)
             ray = pg.PlotDataItem([p[0], p[0] + dx], [p[1], p[1] + dy],
                                   pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))

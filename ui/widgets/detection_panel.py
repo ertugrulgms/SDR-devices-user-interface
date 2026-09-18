@@ -16,6 +16,7 @@ import time
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QListWidget, QListWidgetItem, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _EXPORT_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -76,7 +77,11 @@ class DetectionPanel(QWidget):
     def update_detections(self, detections: list):
         """Tespit listesini güncelle. detections: [{freq_mhz, power_dbfs, snr_db, bw_mhz, first_ts}]"""
         self._detections = list(detections or [])
-        self.lbl_title.setText(f"TESPİT EDİLEN SİNYALLER: {len(self._detections)}")
+        new_count = sum(1 for d in self._detections if d.get("is_new"))
+        if new_count:
+            self.lbl_title.setText(f"TESPİT: {len(self._detections)}   🎯 YENİ: {new_count}")
+        else:
+            self.lbl_title.setText(f"TESPİT EDİLEN SİNYALLER: {len(self._detections)}")
         self.btn_export.setEnabled(bool(self._detections))
 
         # Seçili satırı koru (kullanıcı listeyi incelerken kaymasın)
@@ -87,10 +92,15 @@ class DetectionPanel(QWidget):
             bw_str = f"{bw*1000:>5.0f} kHz" if 0 < bw < 1.0 else (f"{bw:>5.1f} MHz" if bw > 0 else "   —   ")
             ts = d.get("first_ts", 0.0) or 0.0
             t_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts > 0 else "  --:--  "
-            text = (f"  {t_str}  {d['freq_mhz']:>9.3f} MHz  "
+            is_new = bool(d.get("is_new"))
+            marker = "🎯" if is_new else "  "
+            text = (f"{marker}{t_str}  {d['freq_mhz']:>9.3f} MHz  "
                     f"{d['power_dbfs']:>5.0f} dBFS  {d['snr_db']:>3.0f}  {bw_str}")
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, float(d["freq_mhz"]))   # çift tık için frekans
+            if is_new:                                    # YENİ (yayına başlayan) = kırmızı + kalın
+                item.setForeground(QBrush(QColor("#ff5252")))
+                f = item.font(); f.setBold(True); item.setFont(f)
             self.detection_list.addItem(item)
         if 0 <= prev_row < self.detection_list.count():
             self.detection_list.setCurrentRow(prev_row)

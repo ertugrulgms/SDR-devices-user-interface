@@ -11,6 +11,8 @@ class DFPanel(QWidget):
     node_positions_changed = pyqtSignal(list)  # [(mesafe_m, açı°), ...] yardımcı düğümler için
     calibration_toggled = pyqtSignal(bool, float) # is_checked, reference_deg
     debug_iq_clicked = pyqtSignal()
+    forward_gate_set = pyqtSignal(float)   # "İleri Yönü Ayarla" -> yarı-genişlik (derece)
+    forward_gate_cleared = pyqtSignal()    # ileri-yay kapısını kapat
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,6 +64,36 @@ class DFPanel(QWidget):
                                           "background-color: #10222a; padding: 4px; border-radius: 4px;")
         self.lbl_live_angle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout_angle.addWidget(self.lbl_live_angle)
+
+        # İLERİ YÖN KAPISI: anteni alanın ortasına çevir -> "İleri Yönü Ayarla" o anki açıyı yay MERKEZİ
+        # yapar; kerteriz yalnızca [merkez±yarı] içinde aranır (arka/yay-dışı sahte kerterizler elenir).
+        # Ana istasyon: yarı ~90 (180° yay). Köşe aux'lar kendi arayüzünde ~60 (120° yay) ayarlar.
+        self._fwd_active = False
+        fwd_row = QHBoxLayout()
+        fwd_row.setSpacing(6)
+        self.btn_fwd = QPushButton("İleri Yönü Ayarla")
+        self.btn_fwd.setToolTip(
+            "Anteni alanın ORTASINA çevir, bas: o anki açı 'ileri' merkez olur.\n"
+            "Kerteriz yalnızca bu yay içinde aranır -> arkadaki şehir sinyali/yansıması elenir.\n"
+            "Tekrar basınca kapanır (360° tarama).")
+        self.btn_fwd.setStyleSheet("font-size: 13px; font-weight: bold; background-color: #00695c; "
+                                   "color: white; border-radius: 4px; padding: 4px;")
+        self.btn_fwd.clicked.connect(self.on_forward_toggled)
+        fwd_row.addWidget(self.btn_fwd, stretch=3)
+        fwd_row.addWidget(QLabel("Yarı:"))
+        self.spin_fwd_half = QDoubleSpinBox()
+        self.spin_fwd_half.setRange(10.0, 179.0)
+        self.spin_fwd_half.setValue(90.0)          # ana istasyon varsayılanı (180° yay)
+        self.spin_fwd_half.setSuffix("°")
+        self.spin_fwd_half.setDecimals(0)
+        self.spin_fwd_half.setStyleSheet("font-size: 13px; padding: 2px; background-color: #333; "
+                                         "color: #fff; border: 1px solid #555; border-radius: 4px;")
+        fwd_row.addWidget(self.spin_fwd_half, stretch=1)
+        layout_angle.addLayout(fwd_row)
+
+        self.lbl_fwd_status = QLabel("İleri yay: kapalı (360°)")
+        self.lbl_fwd_status.setStyleSheet("font-size: 12px; color: #80cbc4; padding-left: 2px;")
+        layout_angle.addWidget(self.lbl_fwd_status)
 
         self.lbl_dev1_ang = QLabel("SDR-1: --° --'")
         self.lbl_dev2_ang = QLabel("SDR-2: --° --'")
@@ -230,6 +262,34 @@ class DFPanel(QWidget):
             self.btn_df_calibrate.setStyleSheet("font-size: 15px; font-weight: bold; background-color: #2e7d32; color: white; border-radius: 4px; padding: 4px;")
             self.lbl_df_rms.setText("RMS Hata: -- ° (N=0)")
             self.calibration_toggled.emit(False, 0.0)
+
+    def on_forward_toggled(self):
+        """İleri Yönü Ayarla (toggle): açıkken kapatır, kapalıyken o anki açıyı merkez yapıp açar."""
+        if self._fwd_active:
+            self._fwd_active = False
+            self.btn_fwd.setText("İleri Yönü Ayarla")
+            self.btn_fwd.setStyleSheet("font-size: 13px; font-weight: bold; background-color: #00695c; "
+                                       "color: white; border-radius: 4px; padding: 4px;")
+            self.lbl_fwd_status.setText("İleri yay: kapalı (360°)")
+            self.forward_gate_cleared.emit()
+        else:
+            self._fwd_active = True
+            self.btn_fwd.setText("İleri Yön: AKTİF (kapat)")
+            self.btn_fwd.setStyleSheet("font-size: 13px; font-weight: bold; background-color: #c62828; "
+                                       "color: white; border-radius: 4px; padding: 4px;")
+            self.forward_gate_set.emit(float(self.spin_fwd_half.value()))
+
+    def update_forward_status(self, center, half):
+        """Payload'dan ileri-yay durumunu göster (center None -> kapalı). Backend gerçeğiyle senkron."""
+        if center is None:
+            self._fwd_active = False
+            self.btn_fwd.setText("İleri Yönü Ayarla")
+            self.btn_fwd.setStyleSheet("font-size: 13px; font-weight: bold; background-color: #00695c; "
+                                       "color: white; border-radius: 4px; padding: 4px;")
+            self.lbl_fwd_status.setText("İleri yay: kapalı (360°)")
+        else:
+            self._fwd_active = True
+            self.lbl_fwd_status.setText(f"İleri yay: {center:.0f}° ±{half:.0f}° (aktif) ✓")
 
     def update_angles(self, angles, dms_func):
         labels = [self.lbl_dev1_ang, self.lbl_dev2_ang, self.lbl_dev3_ang]

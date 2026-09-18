@@ -162,10 +162,10 @@ class _AuxPattern:
             return 0.0
         return float(max(0.0, 360.0 - max(float(np.diff(a).max()), (a[0] + 360.0) - a[-1])))
 
-    def match(self, az_deg, power_db, freq_hz):
+    def match(self, az_deg, power_db, freq_hz, arc_center=None, arc_half=None):
         """(az, güç) örneklerini frekansın kalibre pattern'ine oturtur -> {bearing_deg, sigma_deg,
         quality_ok, coverage_deg, front_back_db, ambiguity_z, ...} veya None. Merkezle aynı algoritma:
-        interpolasyon + aralık kapısı + açısal kapsama + ambiguity + parabolik σ."""
+        interpolasyon + aralık kapısı + açısal kapsama + ambiguity + parabolik σ + İLERİ-YAY kısıtı."""
         if not self._ok:
             return None
         az = np.asarray(az_deg, float) % 360.0
@@ -186,21 +186,37 @@ class _AuxPattern:
             return np.interp((np.asarray(x) + pk) % 360.0, ae, pe)
 
         betas = np.arange(0.0, 360.0, 1.0)
+        full_circle = arc_center is None
+        min_cov = _AUX_MIN_COVERAGE_DEG
+        if not full_circle:
+            d = np.abs(((betas - float(arc_center) + 180.0) % 360.0) - 180.0)
+            betas = betas[d <= float(arc_half)]
+            if len(betas) < 5:
+                return None
+            min_cov = min(_AUX_MIN_COVERAGE_DEG, 0.7 * 2.0 * float(arc_half))
         cost = np.array([float(np.dot(pm - pref_bore(b - az), pm - pref_bore(b - az))) for b in betas])
         kmin = int(np.argmin(cost)); beta = float(betas[kmin]); cmin = float(cost[kmin])
-        guard = int(round(_AUX_AMBIG_GUARD_DEG))
-        offs = np.abs(((np.arange(len(betas)) - kmin + len(betas) // 2) % len(betas)) - len(betas) // 2)
-        second = float(np.min(cost[offs > guard])) if np.any(offs > guard) else float(cost.max())
+        angd = np.abs(((betas - betas[kmin] + 180.0) % 360.0) - 180.0)
+        outside = angd > _AUX_AMBIG_GUARD_DEG
+        second = float(np.min(cost[outside])) if np.any(outside) else float(cost.max())
         ambiguity_z = (second / max(cmin, 1e-9) - 1.0) * np.sqrt(n / 2.0)
-        c0, c1, c2 = cost[(kmin - 1) % len(betas)], cost[kmin], cost[(kmin + 1) % len(betas)]
-        a = 0.5 * (c0 + c2 - 2.0 * c1)
+        nb = len(betas)
+        if full_circle:
+            k0, k2 = (kmin - 1) % nb, (kmin + 1) % nb
+        else:
+            k0, k2 = kmin - 1, kmin + 1
+        if 0 <= k0 and k2 < nb:
+            c0, c1, c2 = cost[k0], cost[kmin], cost[k2]
+            a = 0.5 * (c0 + c2 - 2.0 * c1)
+        else:
+            a = 0.0
         if a > 1e-9:
             beta = (beta + 0.5 * (c0 - c2) / (c0 - 2.0 * c1 + c2)) % 360.0
             sigma = float(np.sqrt(max(cmin, 1e-9) / max(n - 1, 1) / a))
         else:
             sigma = _AUX_SIGMA_CEIL
         sigma = float(np.clip(sigma, _AUX_SIGMA_FLOOR, _AUX_SIGMA_CEIL))
-        quality_ok = ((fb >= _AUX_MIN_FB_DB) and (cov >= _AUX_MIN_COVERAGE_DEG)
+        quality_ok = ((fb >= _AUX_MIN_FB_DB) and (cov >= min_cov)
                       and (ambiguity_z >= _AUX_MIN_AMBIG_Z) and (a > 1e-9)
                       and (sigma < _AUX_SIGMA_CEIL))
         return {"bearing_deg": round(beta, 2), "sigma_deg": round(sigma, 2),
@@ -234,12 +250,27 @@ class AmplitudeDF:
         self._pattern = _aux_pattern() if use_pattern and _aux_pattern().available() else None
         self._last_sigma = _AUX_SIGMA_CENTROID
         self._last_method = "centroid"
+        self.fwd_center = None          # ileri-yay kapısı merkezi (derece); None = KAPALI (360°)
+        self.fwd_half = 60.0            # köşe aux varsayılanı: ±60° (120° yay)
 
     def reset(self):
         self._bins.clear()
 
     def set_freq(self, freq_hz):
         self.freq_hz = float(freq_hz) if freq_hz else None
+
+    def set_forward_gate(self, center_deg, half_deg=None):
+        self.fwd_center = float(center_deg) % 360.0
+        if half_deg is not None:
+            self.fwd_half = float(np.clip(half_deg, 5.0, 179.0))
+
+    def clear_forward_gate(self):
+        self.fwd_center = None
+
+    def _in_arc(self, az):
+        if self.fwd_center is None:
+            return True
+        return abs(((float(az) - self.fwd_center + 180.0) % 360.0) - 180.0) <= self.fwd_half
 
     def last_sigma(self):
         return self._last_sigma
@@ -266,6 +297,12 @@ class AmplitudeDF:
             return None, -120.0, 0.0, len(self._bins)
         azs = np.array([k * self.bin_deg for k in self._bins.keys()])
         amps = np.array([v[0] for v in self._bins.values()])
+        # İLERİ-YAY KAPISI (merkezle aynı): açıksa yalnızca yay içi örneklerle çalış (arka/yay-dışı elenir).
+        if self.fwd_center is not None:
+            m_arc = np.array([self._in_arc(a) for a in azs])
+            azs, amps = azs[m_arc], amps[m_arc]
+            if len(azs) < 3:
+                return None, -120.0, 0.0, len(self._bins)
         pk = int(np.argmax(amps))
         peak_az, peak_amp, floor = float(azs[pk]), float(amps[pk]), float(np.min(amps))
         offs = ((azs - peak_az + 180.0) % 360.0) - 180.0
@@ -278,7 +315,8 @@ class AmplitudeDF:
         # KALİTE KAPISI (gerçek fallback): pattern yalnızca quality_ok ise kullanılır; aksi halde
         # centroid kerterizi korunur (bearing atılmaz-sadece-σ-şişir DEĞİL).
         if self._pattern is not None and self.freq_hz:
-            m = self._pattern.match(azs, amps, self.freq_hz)
+            m = self._pattern.match(azs, amps, self.freq_hz,
+                                    arc_center=self.fwd_center, arc_half=self.fwd_half)
             if m is not None:
                 if m["quality_ok"]:
                     bearing = m["bearing_deg"]
@@ -571,6 +609,20 @@ class AuxWorker(QThread):
         self._last_bearing = None       # önbellekli kerterizi de temizle
         self.log.emit("Kerteriz sıfırlandı — yeni tarama için anteni döndürün.")
 
+    def set_forward_gate(self, half_deg):
+        """İleri Yönü Ayarla: o anki enkoder açısını ileri-yay merkezi yap; kerteriz yalnızca yay içinde
+        aranır (arka/yay-dışı elenir). Enkoder bağlı olmalı."""
+        if not self.enc.connected:
+            self.log.emit("⚠️ İleri yön için enkoder bağlı olmalı. Anteni alanın ortasına çevirip tekrar dene.")
+            return
+        center = float(self.enc.get_angle())
+        self.df.set_forward_gate(center, half_deg)
+        self.log.emit(f"🧭 İleri yön ayarlandı: {center:.0f}° ±{half_deg:.0f}° (yay {2*half_deg:.0f}°).")
+
+    def clear_forward_gate(self):
+        self.df.clear_forward_gate()
+        self.log.emit("İleri yön kapısı KAPATILDI (360°).")
+
     def set_sending(self, on):
         self.sending = on
         self.log.emit("Merkeze gönderim: " + ("AÇIK" if on else "KAPALI"))
@@ -777,6 +829,23 @@ class AuxWindow(QMainWindow):
         self.chk_send.setChecked(True)
         self.chk_send.setStyleSheet("color:#e0e0e0;font-size:14px;")
         rf.addWidget(self.chk_send, 0, 6)
+
+        # İLERİ YÖN KAPISI (köşe aux ~90° görür): anteni alan ortasına çevir -> "İleri Yönü Ayarla"
+        # o anki açıyı yay merkezi yapar; kerteriz yalnızca [merkez±yarı] içinde aranır (arka elenir).
+        self._fwd_active = False
+        rf.addWidget(QLabel("İleri yay yarı:"), 1, 0)
+        self.spin_fwd_half = QDoubleSpinBox()
+        self.spin_fwd_half.setRange(10.0, 179.0); self.spin_fwd_half.setValue(60.0)  # köşe aux: ±60° (120°)
+        self.spin_fwd_half.setSuffix("°"); self.spin_fwd_half.setDecimals(0)
+        rf.addWidget(self.spin_fwd_half, 1, 1)
+        self.btn_fwd = QPushButton("İleri Yönü Ayarla")
+        self.btn_fwd.setStyleSheet("background:#00695c;color:#fff;font-weight:bold;padding:8px;")
+        self.btn_fwd.setToolTip("Anteni gördüğün alanın ORTASINA çevir, bas. Kerteriz sadece bu yayda aranır.\n"
+                                "Tekrar basınca kapanır (360°).")
+        rf.addWidget(self.btn_fwd, 1, 2)
+        self.lbl_fwd = QLabel("İleri yay: kapalı (360°)")
+        self.lbl_fwd.setStyleSheet("color:#80cbc4;font-size:13px;")
+        rf.addWidget(self.lbl_fwd, 1, 3, 1, 4)
         root.addLayout(rf)
 
         # --- Büyük göstergeler: Açı ve dBm ---
@@ -857,10 +926,34 @@ class AuxWindow(QMainWindow):
         self.btn_north.clicked.connect(self.worker.set_north)
         self.btn_reset.clicked.connect(self.worker.reset_bearing)
         self.chk_send.toggled.connect(self.worker.set_sending)
+        self.btn_fwd.clicked.connect(self._on_forward_toggled)
 
         self._x = None
         self.worker.start()
         self.add_log(f"Yardımcı istasyon başladı: {cfg['id']} → {cfg['host']}:{cfg['port']}")
+
+    def _on_forward_toggled(self):
+        """İleri Yönü Ayarla (toggle): açıkken kapat, kapalıyken o anki açıyı merkez yapıp aç."""
+        if self._fwd_active:
+            self._fwd_active = False
+            self.btn_fwd.setText("İleri Yönü Ayarla")
+            self.btn_fwd.setStyleSheet("background:#00695c;color:#fff;font-weight:bold;padding:8px;")
+            self.lbl_fwd.setText("İleri yay: kapalı (360°)")
+            self.worker.clear_forward_gate()
+        else:
+            self._fwd_active = True
+            half = float(self.spin_fwd_half.value())
+            self.btn_fwd.setText("İleri Yön: AKTİF")
+            self.btn_fwd.setStyleSheet("background:#c62828;color:#fff;font-weight:bold;padding:8px;")
+            self.worker.set_forward_gate(half)
+            # merkez worker log'unda görünür; etikette yay genişliğini göster (enkoder yoksa worker uyarır)
+            c = self.worker.df.fwd_center
+            self.lbl_fwd.setText(f"İleri yay: {c:.0f}° ±{half:.0f}° (aktif) ✓" if c is not None
+                                 else "İleri yay: enkoder yok — ayarlanamadı")
+            if c is None:
+                self._fwd_active = False
+                self.btn_fwd.setText("İleri Yönü Ayarla")
+                self.btn_fwd.setStyleSheet("background:#00695c;color:#fff;font-weight:bold;padding:8px;")
 
     def on_data(self, d):
         # Spektrum

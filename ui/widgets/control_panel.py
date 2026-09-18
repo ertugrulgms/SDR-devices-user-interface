@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                             QSlider, QDoubleSpinBox, QComboBox, QPushButton)
+                             QSlider, QDoubleSpinBox, QComboBox, QPushButton, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 class ControlPanel(QWidget):
@@ -12,6 +12,10 @@ class ControlPanel(QWidget):
     open_tx_dialog = pyqtSignal()
     scan_toggled = pyqtSignal()          # BANT TARA aç/kapa (sinyal tespiti, 5.1.1)
     scan_sensitivity_changed = pyqtSignal(int)   # tarama hassasiyeti (CFAR yerel-belirginlik, dB)
+    scan_baseline_requested = pyqtSignal()       # "Referans Al" — yeni sinyal vurgulama
+    scan_baseline_cleared = pyqtSignal()         # referansı temizle
+    # (bw_min_khz, bw_max_khz, top_n): 0 = kapalı. Görünüm filtreleri (ham tespiti bozmaz).
+    scan_filters_changed = pyqtSignal(float, float, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -190,6 +194,45 @@ class ControlPanel(QWidget):
         sens_row.addWidget(self.lbl_sens_val)
         layout.addLayout(sens_row)
 
+        # YENİ SİNYAL BULMA yardımcıları: Referans (hedef=yayına başlayan) + görünüm filtreleri.
+        find_row = QHBoxLayout()
+        find_row.setSpacing(8)
+        self.btn_baseline = QPushButton("🎯 Referans Al")
+        self.btn_baseline.setToolTip(
+            "Hedef HENÜZ yayında değilken bas: o anki tüm ortam sinyalleri (LTE/WiFi/mevcut telsizler)\n"
+            "arka plan olarak kaydedilir. Sonra hedef yayına başlayınca, referansta OLMAYAN o frekans\n"
+            "'YENİ HEDEF' olarak KIRMIZI vurgulanır. (Önce BANT TARA açık olmalı.)")
+        self.btn_baseline.setStyleSheet(
+            "QPushButton{background:#00695c;color:#fff;font-weight:bold;font-size:12px;padding:5px 10px;border-radius:5px;}"
+            "QPushButton:hover{background:#00897b;}")
+        self.btn_baseline.clicked.connect(self.scan_baseline_requested.emit)
+        find_row.addWidget(self.btn_baseline, stretch=2)
+
+        self.btn_baseline_clear = QPushButton("Sıfırla")
+        self.btn_baseline_clear.setToolTip("Referansı temizle (yeni-sinyal vurgusu kapanır).")
+        self.btn_baseline_clear.setStyleSheet(
+            "QPushButton{background:#455a64;color:#fff;font-size:12px;padding:5px 8px;border-radius:5px;}")
+        self.btn_baseline_clear.clicked.connect(self.scan_baseline_cleared.emit)
+        find_row.addWidget(self.btn_baseline_clear, stretch=1)
+        layout.addLayout(find_row)
+
+        # Görünüm filtreleri: sadece haberleşme bandı (dar) + en güçlü 10.
+        filt_row = QHBoxLayout()
+        filt_row.setSpacing(10)
+        self.chk_comms_bw = QCheckBox("Sadece telsiz bandı (5–50 kHz)")
+        self.chk_comms_bw.setToolTip("LTE/WiFi (MHz'lerce geniş) ve tek-bin gürültü dikenlerini gizler;\n"
+                                     "yalnızca haberleşme-genişlikli (dar-bant) sinyaller listelenir.")
+        self.chk_comms_bw.setStyleSheet("font-size: 12px; color: #cfc0d8;")
+        self.chk_comms_bw.toggled.connect(self._on_filters_changed)
+        filt_row.addWidget(self.chk_comms_bw, stretch=2)
+
+        self.chk_top10 = QCheckBox("En güçlü 10")
+        self.chk_top10.setToolTip("Listeyi en güçlü 10 sinyalle sınırla (güce göre; yeni sinyaller üstte).")
+        self.chk_top10.setStyleSheet("font-size: 12px; color: #cfc0d8;")
+        self.chk_top10.toggled.connect(self._on_filters_changed)
+        filt_row.addWidget(self.chk_top10, stretch=1)
+        layout.addLayout(filt_row)
+
         # NOT: "Tespit Edilen Sinyaller" listesi ALT SATIRDAKİ DetectionPanel'e taşındı
         # (ui/widgets/detection_panel.py) — orada daha geniş, ilk-görülme saatli, çift-tıkla-tune'lu
         # ve CSV'ye aktarılabilir. Burada yalnızca tarama BUTONU ve aralık kutuları kalır.
@@ -204,6 +247,13 @@ class ControlPanel(QWidget):
         tier = "Seçici" if value >= 15 else ("Hassas" if value <= 9 else "Dengeli")
         self.lbl_sens_val.setText(f"{tier} ({value} dB)")
         self.scan_sensitivity_changed.emit(value)
+
+    def _on_filters_changed(self, _=None):
+        """Bant genişliği + en-güçlü-N filtrelerini worker'a bildir (görünüm; ham tespiti bozmaz)."""
+        bw_min = 5.0 if self.chk_comms_bw.isChecked() else 0.0
+        bw_max = 50.0 if self.chk_comms_bw.isChecked() else 0.0
+        top_n = 10 if self.chk_top10.isChecked() else 0
+        self.scan_filters_changed.emit(bw_min, bw_max, top_n)
 
     def set_capturing_state(self, is_capturing: bool):
         if is_capturing:

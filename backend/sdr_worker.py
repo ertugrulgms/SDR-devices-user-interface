@@ -94,6 +94,14 @@ SCAN_SHOULDER_MIN_MHZ = 0.10     # minimum gölge yarıçapı (dar taşıyıcın
 SCAN_PROMINENCE_DB = 12.0        # CFAR: tespit, YEREL çevre tabanını bu kadar aşmalı (varsayılan
                                  # hassasiyet). Güçlü taşıyıcının yükselttiği DÜZ gürültü tabanını eler;
                                  # gerçek TEPE'yi tutar. Sürgüyle ayarlanabilir (set_scan_sensitivity).
+# YENİ SİNYAL VURGULAMA: yarışmada hedef, biz dinlerken YAYINA BAŞLAYAN sinyaldir. Operatör "Referans
+# Al"a basınca o anki tüm ortam sinyalleri (LTE/WiFi/mevcut telsizler) arka plan olarak kaydedilir;
+# sonradan referansta OLMAYAN ya da belirgin GÜÇLENEN frekans "YENİ HEDEF" işaretlenir.
+SCAN_NEW_SIGNAL_DELTA_DB = 6.0   # referanstaki güce göre bu kadar artış -> "yeni/değişti" say
+# HABERLEŞME BANT GENİŞLİĞİ filtresi (varsayılan sınırlar; arayüzden açılır). Telsiz/haberleşme
+# dar-banttır (~5–50 kHz); bu aralık dışını gizleyince LTE/WiFi (MHz'lerce) ve tek-bin gürültü elenir.
+SCAN_COMMS_BW_MIN_KHZ = 5.0
+SCAN_COMMS_BW_MAX_KHZ = 50.0
 # --- OTOMATİK KAZANÇ KONTROLÜ (AGC) ---
 RX_GAIN_MAX_DB = 76.0             # B200mini RX kazanç üst sınırı
 AGC_INTERVAL_SEC = 0.3            # AGC en fazla bu sıklıkta kazanç değiştirir (donanım otursun)
@@ -250,6 +258,14 @@ class SDRWorker(QThread):
         self._scan_candidates = {}    # key -> aday (onay için); SCAN_CONFIRM_HITS turda görülünce PROMOTE
         self.scan_prominence_db = SCAN_PROMINENCE_DB   # CFAR yerel-belirginlik eşiği (sürgü ayarlar)
         self._nf_trackers = {}        # merkez-frekans -> NoiseFloorTracker (tarihsel-min gürültü tabanı)
+        # YENİ SİNYAL VURGULAMA (referans + delta): hedef = yayına başlayan.
+        self._scan_baseline = None     # dondurulmuş referans {key: power_dbfs} (ortam arka planı)
+        self._baseline_capture = None  # referans alınırken biriken sözlük (bir tam tarama boyunca)
+        self._baseline_swept_mhz = 0.0 # referans yakalarken taranan toplam genişlik (tam tur tespiti)
+        # ARAYÜZ FİLTRELERİ (görünüm; ham tespitleri bozmaz): bant genişliği aralığı + en güçlü N.
+        self.scan_bw_min_khz = 0.0     # 0 = alt sınır yok
+        self.scan_bw_max_khz = 0.0     # 0 = üst sınır yok
+        self.scan_top_n = 0            # 0 = hepsi; >0 = yalnız en güçlü N
 
         # Kapalı-çevrim akıllı karıştırma: son ölçülen hedef sinyalin bandı/offseti (RX'ten).
         # Jamming başlarken bu banda odaklanılır (gücü tüm banda değil hedefe topla).
@@ -953,6 +969,9 @@ class SDRWorker(QThread):
             "self_df_method": self.self_amp_df.last_method(),
             "self_df_sigma_deg": round(self.self_amp_df.last_sigma(), 2),
             "self_df_coverage_deg": round(self.self_amp_df.last_coverage(), 1),
+            # İLERİ-YAY KAPISI durumu (arayüz etiketi): merkez None ise kapalı.
+            "self_fwd_center": self.self_amp_df.fwd_center,
+            "self_fwd_half": self.self_amp_df.fwd_half,
         }
 
     def _refine_fm_fsk(self, snap):
@@ -1278,6 +1297,8 @@ class SDRWorker(QThread):
         self.scan_detections = {}
         self._scan_candidates = {}      # onaylanmamış adaylar: key -> {..., hits, first_ts, last_ts}
         self._nf_trackers = {}          # tarihsel-min gürültü tabanları sıfırlanır
+        self._scan_baseline = None      # yeni tarama -> eski referans geçersiz
+        self._baseline_capture = None
         self.set_frequency(lo, quiet=True)
         self._scan_settle_until = time.time() + SCAN_SETTLE_SEC
         self.scan_active = True
@@ -1296,6 +1317,50 @@ class SDRWorker(QThread):
     def stop_scan_rf(self):
         self.scan_active = False
         self.log_signal.emit(f"⏹ Bant tarama durduruldu. Toplam {len(self.scan_detections)} sinyal tespit edildi.")
+
+    def capture_scan_baseline(self):
+        """REFERANS AL: bir sonraki TAM tarama turu boyunca o anki ortam sinyallerini (LTE/WiFi/mevcut
+        telsizler) arka plan olarak kaydeder. Tur bitince referans donar; sonrasında referansta OLMAYAN
+        ya da belirgin GÜÇLENEN frekanslar 'YENİ' işaretlenir (yarışmada hedef = yayına başlayan)."""
+        if not self.scan_active:
+            self.log_signal.emit("⚠️ Referans için önce BANT TARAMA'yı başlat.")
+            return
+        self._baseline_capture = {}
+        self._baseline_swept_mhz = 0.0
+        self._scan_baseline = None
+        self.log_signal.emit("🎯 Referans alınıyor… bir tam tarama turu boyunca ortam kaydediliyor "
+                             "(hedef HENÜZ yayında olmamalı). Tur bitince yeni sinyaller vurgulanacak.")
+
+    def clear_scan_baseline(self):
+        """Referansı temizler (tüm sinyaller yine normal listelenir, 'yeni' vurgusu kalkar)."""
+        self._scan_baseline = None
+        self._baseline_capture = None
+        self.log_signal.emit("Referans temizlendi — yeni-sinyal vurgusu kapalı.")
+
+    def set_scan_filters(self, bw_min_khz=None, bw_max_khz=None, top_n=None):
+        """Arayüz görünüm filtreleri (ham tespitleri BOZMAZ): bant genişliği aralığı (kHz) + en güçlü N.
+        None geçilen alan değişmez. bw_min/max=0 -> o sınır kapalı; top_n=0 -> hepsi."""
+        if bw_min_khz is not None:
+            self.scan_bw_min_khz = float(bw_min_khz)
+        if bw_max_khz is not None:
+            self.scan_bw_max_khz = float(bw_max_khz)
+        if top_n is not None:
+            self.scan_top_n = int(top_n)
+
+    def _scan_is_new(self, key, power_dbfs):
+        """Bu tespit referansa göre YENİ mi: referansta yoktu (±1 bucket tolerans) ya da belirgin
+        güçlendi (> referans + SCAN_NEW_SIGNAL_DELTA_DB). Referans yoksa hiçbir şey 'yeni' değildir."""
+        b = self._scan_baseline
+        if b is None:
+            return False
+        base = None
+        for k in (key - 1, key, key + 1):
+            v = b.get(k)
+            if v is not None:
+                base = v if base is None else max(base, v)
+        if base is None:
+            return True                                   # frekans referansta yoktu -> YENİ HEDEF
+        return power_dbfs > base + SCAN_NEW_SIGNAL_DELTA_DB
 
     def _service_scan(self):
         """Tarama adımı: mevcut pencerede (GERÇEK ölçülen FFT) gürültü üstü tepeleri tespit et,
@@ -1330,6 +1395,11 @@ class SDRWorker(QThread):
                     dc_guard_bins=SCAN_DC_GUARD_BINS, close_gap_bins=close_gap,
                     prominence_db=self.scan_prominence_db):
                 key = round(freq / SCAN_MERGE_MHZ)
+                # REFERANS ALINIYORSA: bu frekanstaki ortam gücünü arka plana kaydet (Max-Hold).
+                if self._baseline_capture is not None:
+                    b = self._baseline_capture.get(key)
+                    if b is None or pwr > b:
+                        self._baseline_capture[key] = pwr
                 prev = self.scan_detections.get(key)
                 if prev is not None:
                     # ZATEN ONAYLI -> Max-Hold ile güncelle (sıralı-yayın senaryosunda kalıcı kalır).
@@ -1373,6 +1443,15 @@ class SDRWorker(QThread):
                 weakest = min(self.scan_detections, key=lambda k: self.scan_detections[k]["power_dbfs"])
                 del self.scan_detections[weakest]
 
+        # REFERANS YAKALAMA tam-tur tespiti: bir tam bant genişliği tarandıysa referansı DONDUR.
+        if self._baseline_capture is not None:
+            self._baseline_swept_mhz += self.scan_step_mhz
+            if self._baseline_swept_mhz >= (self.scan_stop_mhz - self.scan_start_mhz):
+                self._scan_baseline = self._baseline_capture
+                self._baseline_capture = None
+                self.log_signal.emit(f"✅ Referans hazır: {len(self._scan_baseline)} ortam sinyali "
+                                     f"kaydedildi. Artık YENİ (yayına başlayan) sinyaller vurgulanır.")
+
         # Bir sonraki frekansa geç (sınıra ulaşınca başa sar -> sürekli izleme)
         self.scan_cursor_mhz += self.scan_step_mhz
         if self.scan_cursor_mhz > self.scan_stop_mhz:
@@ -1398,11 +1477,32 @@ class SDRWorker(QThread):
                     break
             if not shadowed:
                 kept.append(d)
-        return sorted(
-            ({"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
-              "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0),
-              "first_ts": d.get("first_ts", d.get("ts", 0.0))} for d in kept),
-            key=lambda x: x["freq_mhz"])
+
+        # BANT GENİŞLİĞİ FİLTRESİ (arayüz): aralık dışını gizle (LTE/WiFi ve tek-bin gürültü elenir).
+        bmin, bmax = self.scan_bw_min_khz, self.scan_bw_max_khz
+        if bmin > 0 or bmax > 0:
+            filt = []
+            for d in kept:
+                bw_khz = (d.get("bw_mhz", 0.0) or 0.0) * 1000.0
+                if bmin > 0 and bw_khz < bmin:
+                    continue
+                if bmax > 0 and bw_khz > bmax:
+                    continue
+                filt.append(d)
+            kept = filt
+
+        # YENİ (referansa göre) işaretle + çıktı sözlüğü
+        out = [{"freq_mhz": round(d["freq_mhz"], 3), "power_dbfs": d["power_dbfs"],
+                "snr_db": d["snr_db"], "bw_mhz": d.get("bw_mhz", 0.0),
+                "first_ts": d.get("first_ts", d.get("ts", 0.0)),
+                "is_new": self._scan_is_new(round(d["freq_mhz"] / SCAN_MERGE_MHZ), d["power_dbfs"])}
+               for d in kept]
+
+        # EN GÜÇLÜ N (top_n>0) — güce göre kes. Sıralama: YENİ önce, sonra güç (hedef üste çıksın).
+        out.sort(key=lambda x: (not x["is_new"], -x["power_dbfs"]))
+        if self.scan_top_n > 0:
+            out = out[:self.scan_top_n]
+        return out
 
     def set_gain(self, gain_db: float):
         self.gain_db = float(gain_db)
@@ -1523,6 +1623,23 @@ class SDRWorker(QThread):
         """DF kalibrasyon modunu kapatır."""
         self.df_tracker.clear_reference()
         self.log_signal.emit("Backend: DF Kalibrasyonu durduruldu.")
+
+    def set_forward_gate(self, half_deg: float):
+        """İLERİ YÖNÜ AYARLA: o anki anten (enkoder) açısını ileri-yay MERKEZİ olarak yakalar; kerteriz
+        artık yalnızca [merkez±half] içinde aranır (arkadaki/yay-dışı sahte kerterizler elenir). Alanın
+        önde olduğu ve arkada hedef olmadığı bilindiğinde doğruluğu artırır. Enkoder bağlı olmalı."""
+        if not self.hw_ctrl.is_connected:
+            self.log_signal.emit("⚠️ İleri yön için ENKODER bağlı olmalı. Anteni alanın ortasına çevirip tekrar dene.")
+            return
+        center = float(self.hw_ctrl.get_angle())
+        self.self_amp_df.set_forward_gate(center, half_deg)
+        self.log_signal.emit(f"🧭 İleri yön ayarlandı: merkez {center:.0f}° ±{half_deg:.0f}° "
+                             f"(toplam yay {2*half_deg:.0f}°). Bu yay dışındaki kerterizler elenir.")
+
+    def clear_forward_gate(self):
+        """İleri-yay kapısını kapat (kerteriz tam 360° aranır — varsayılan)."""
+        self.self_amp_df.clear_forward_gate()
+        self.log_signal.emit("İleri yön kapısı KAPATILDI (360° tarama).")
 
     def get_aux_node_positions(self) -> list:
         """Yardımcı (self-olmayan) düğümlerin KUTUPSAL konumunu döndürür: [(id, mesafe_m, açı°), ...].

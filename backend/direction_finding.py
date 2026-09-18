@@ -189,6 +189,11 @@ class AmplitudeDFEstimator:
         self._last_sigma = SIGMA_CENTROID_DEG   # son bearing()'in belirsizliği (derece) — ağırlıklı üçgenleme için
         self._last_method = "centroid"          # "pattern" | "centroid" | ... (teşhis / arayüz)
         self._last_coverage = 0.0               # son taramanın açısal kapsaması (derece) — teşhis
+        # İLERİ-YAY KAPISI (opsiyonel): alanın önünde olduğu bilindiğinde, kerteriz araması yalnızca
+        # [merkez±yarı] içinde yapılır -> arkadaki/yay-dışı sahte kerterizler (şehir yansıması, arka lob)
+        # elenir; dar ileri-taramada (köşe istasyon ~90°) pattern eşleştirme de açık kalır. None=kapalı.
+        self.fwd_center = None                  # ileri yön merkezi (derece) — None ise kapı KAPALI
+        self.fwd_half = 90.0                    # yay yarı-genişliği (derece); toplam yay = 2×bu
 
     def reset(self):
         self._bins.clear()
@@ -196,6 +201,26 @@ class AmplitudeDFEstimator:
     def set_freq(self, freq_hz):
         """Kaynak frekansını ayarlar (pattern eşleştirme frekansa bağlı). None -> pattern kapalı."""
         self.freq_hz = float(freq_hz) if freq_hz else None
+
+    def set_forward_gate(self, center_deg, half_deg=None):
+        """İleri-yay kapısını aç: kerteriz yalnızca [center±half] içinde aranır. half None -> mevcut kalır."""
+        self.fwd_center = float(center_deg) % 360.0
+        if half_deg is not None:
+            self.fwd_half = float(np.clip(half_deg, 5.0, 179.0))
+
+    def clear_forward_gate(self):
+        """İleri-yay kapısını kapat (tam 360° arama)."""
+        self.fwd_center = None
+
+    def forward_gate(self):
+        """(merkez, yarı) veya (None, yarı) — arayüz/teşhis için."""
+        return self.fwd_center, self.fwd_half
+
+    def _in_arc(self, az_deg):
+        """az ileri yay içinde mi (kapı kapalıysa daima True)."""
+        if self.fwd_center is None:
+            return True
+        return abs(((float(az_deg) - self.fwd_center + 180.0) % 360.0) - 180.0) <= self.fwd_half
 
     def last_sigma(self) -> float:
         """Son bearing() çağrısının kerteriz belirsizliği (derece). Üçgenlemede 1/σ² ağırlık için."""
@@ -234,6 +259,13 @@ class AmplitudeDFEstimator:
 
         azs = np.array([k * self.bin_deg for k in self._bins.keys()])
         amps = np.array([v[0] for v in self._bins.values()])
+        # İLERİ-YAY KAPISI: kapalıysa (fwd_center None) hiçbir şey değişmez. Açıksa YALNIZCA yay içindeki
+        # örneklerle çalış -> yay dışı (arka/kenar) tepe kerteriz üretemez. Yeterli örnek yoksa 'ölçülemedi'.
+        if self.fwd_center is not None:
+            in_arc = np.array([self._in_arc(a) for a in azs])
+            azs, amps = azs[in_arc], amps[in_arc]
+            if len(azs) < 3:
+                return None, -120.0, 0.0, len(self._bins)
         peak_i = int(np.argmax(amps))
         peak_az = float(azs[peak_i])
         peak_amp = float(amps[peak_i])
@@ -256,7 +288,8 @@ class AmplitudeDFEstimator:
         # centroid kerterizi KORUNUR (pattern bearing atılır, σ şişirmekle yetinilmez). Frekans/pattern
         # yoksa da centroid.
         if self._pattern is not None and self.freq_hz:
-            m = self._pattern.match(azs, amps, self.freq_hz)
+            m = self._pattern.match(azs, amps, self.freq_hz,
+                                    arc_center=self.fwd_center, arc_half=self.fwd_half)
             if m is not None:
                 self._last_coverage = m.get("coverage_deg", 0.0)
                 if m["quality_ok"]:

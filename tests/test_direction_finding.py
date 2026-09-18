@@ -383,6 +383,53 @@ class TestPatternMatchedDF(unittest.TestCase):
         err_u = np.linalg.norm(x_u[:2] - tgt[:2])
         self.assertLess(err_w, err_u)                  # ağırlıklı, eşit-ağırlıktan daha isabetli
 
+    # --- İLERİ-YAY KAPISI TESTLERİ (arkada alan yok senaryosu) ---------------------------
+    def test_forward_gate_off_is_identical(self):
+        # Kapı KAPALI iken davranış birebir aynı olmalı (gate None -> tam tur)
+        rng = np.random.default_rng(20)
+        encs, power = self._sweep_from_pattern(1575e6, 70.0, 1.5, rng)
+        m_off = self.ap.match(encs, power, 1575e6)
+        m_none = self.ap.match(encs, power, 1575e6, arc_center=None, arc_half=None)
+        self.assertEqual(m_off["bearing_deg"], m_none["bearing_deg"])
+
+    def test_forward_gate_rejects_rear_peak(self):
+        # Hedef önde (137°), ARKADA çok güçlü sahte tepe (330°). Kapı açıkken kerteriz önde kalmalı.
+        est = AmplitudeDFEstimator(use_pattern=False)
+        for az in range(0, 360, 5):
+            d = ((az - 137 + 180) % 360) - 180
+            est.update(az, -90 + 40 * np.cos(np.radians(d)) ** 8 if abs(d) < 90 else -90, now=0.0)
+        for az in range(310, 350, 5):
+            est.update(az, -20.0, now=0.0)              # arkada çok güçlü parazit
+        est.set_forward_gate(140.0, 60.0)              # ileri yay 80..200
+        b_gated, _, _, _ = est.bearing(now=0.0)
+        self.assertLess(abs(((b_gated - 137 + 180) % 360) - 180), 6.0)   # önde kaldı
+        est.clear_forward_gate()
+        b_open, _, _, _ = est.bearing(now=0.0)
+        self.assertGreater(abs(((b_open - 137 + 180) % 360) - 180), 60.0)  # kapalıyken arkaya kaydı
+
+    def test_forward_gate_enables_pattern_on_narrow_sweep(self):
+        # Köşe istasyon yalnızca ~90° tarasa: kapı YOKken kapsama<180 -> pattern kapalı; kapı VARken açık.
+        rng = np.random.default_rng(21)
+        ang, pref, fb, pk = self.ap.pattern_at(1575e6)
+        ae = np.concatenate([ang - 360, ang, ang + 360]); pe = np.concatenate([pref, pref, pref])
+        encs = np.arange(0, 125, 5.0)                  # ~120° dar yay
+        power = np.interp((40.0 - encs + pk) % 360, ae, pe) + rng.normal(0, 1.5, len(encs))
+        self.assertFalse(self.ap.match(encs, power, 1575e6)["quality_ok"])          # yaysız: kapsama düşük
+        m = self.ap.match(encs, power, 1575e6, arc_center=60.0, arc_half=60.0)
+        self.assertTrue(m["quality_ok"])                                            # yaylı: pattern açık
+        self.assertLess(abs(((m["bearing_deg"] - 40 + 180) % 360) - 180), 5.0)
+
+    def test_forward_gate_bearing_stays_in_arc(self):
+        # Yay dışına düşen bir çözüm dönmemeli (arka kaynakta bile bearing yay içinde kalır)
+        rng = np.random.default_rng(22)
+        ang, pref, fb, pk = self.ap.pattern_at(1575e6)
+        ae = np.concatenate([ang - 360, ang, ang + 360]); pe = np.concatenate([pref, pref, pref])
+        encs = np.arange(0, 125, 5.0)
+        power = np.interp((220.0 - encs + pk) % 360, ae, pe) + rng.normal(0, 1.5, len(encs))  # arka kaynak
+        m = self.ap.match(encs, power, 1575e6, arc_center=60.0, arc_half=60.0)
+        diff = abs(((m["bearing_deg"] - 60.0 + 180) % 360) - 180)
+        self.assertLessEqual(diff, 60.0 + 1e-6)        # bearing 0..120 yay içinde
+
     # --- UZMAN İNCELEMESİYLE EKLENEN KAPI/DAYANIKLILIK TESTLERİ ---------------------------
     def test_circular_boundary_bearings(self):
         # 0°/359° dolanma sınırında kerteriz doğru geri kazanılmalı

@@ -156,6 +156,9 @@ class SDRMainWindow(QMainWindow):
         self.control_panel.open_tx_dialog.connect(self.open_tx_dialog)
         self.control_panel.scan_toggled.connect(self.handle_scan_toggle)
         self.control_panel.scan_sensitivity_changed.connect(self.worker.set_scan_sensitivity)
+        self.control_panel.scan_baseline_requested.connect(self.worker.capture_scan_baseline)
+        self.control_panel.scan_baseline_cleared.connect(self.worker.clear_scan_baseline)
+        self.control_panel.scan_filters_changed.connect(self.worker.set_scan_filters)
         # Tespit paneli: çift tıkla -> o frekansa tune;  dışa aktarma -> log
         self.detection_panel.tune_requested.connect(self.tune_to_detection)
         self.detection_panel.exported.connect(
@@ -166,6 +169,8 @@ class SDRMainWindow(QMainWindow):
         self.df_panel.manual_angle_changed.connect(self.manual_angle_changed)
         self.df_panel.node_positions_changed.connect(self.apply_node_positions)
         self.df_panel.calibration_toggled.connect(self.handle_df_calibration_toggle)
+        self.df_panel.forward_gate_set.connect(self.worker.set_forward_gate)
+        self.df_panel.forward_gate_cleared.connect(self.worker.clear_forward_gate)
         self.df_panel.debug_iq_clicked.connect(self.handle_debug_iq_clicked)
         # Kayıtlı yardımcı düğüm konumlarını (df_nodes.json) panele önceden yükle
         self.df_panel.set_node_positions(self.worker.get_aux_node_positions())
@@ -555,6 +560,8 @@ class SDRMainWindow(QMainWindow):
             self.df_panel.update_live_angle(payload.get("encoder_angle_deg"))
             # AUX (NODE-2/3) canlı anten açısı — SDR-2/3 satırında anlık (kerterizin 15 sn gecikmesini beklemez)
             self.df_panel.update_node_live_angles(payload.get("node_live_angles"))
+            # İLERİ-YAY kapısı durumu (buton/etiket backend gerçeğiyle senkron kalsın)
+            self.df_panel.update_forward_status(payload.get("self_fwd_center"), payload.get("self_fwd_half", 90.0))
 
             # PPI radar: gerçek DF payload'ından (düğüm kerterizleri + üçgenleme fix'i) güncelle
             # (payload["encoder_angle_deg"] radarda canlı yön çizgisi olarak çizilir)

@@ -141,8 +141,12 @@ class AntennaPattern:
         largest = float(max(gaps.max(), wrap))
         return float(max(0.0, 360.0 - largest))
 
-    def match(self, meas_az_deg, meas_power_db, freq_hz):
+    def match(self, meas_az_deg, meas_power_db, freq_hz, arc_center=None, arc_half=None):
         """PATTERN EŞLEŞTİRME: ölçülen (azimut, güç) örneklerini frekansın kalibre pattern'ine oturtur.
+
+        İLERİ-YAY KISITI (arc_center, arc_half): verilirse β araması YALNIZCA [merkez±yarı] içinde yapılır
+        (arkadaki/yay-dışı çözümler elenir; dar ileri-taramada template araması iyi-tanımlı olur, arka lob
+        doğal olarak dışarıda kalır -> ambiguity iyileşir). None ise tam 360° aranır (varsayılan, kapalı).
 
         Model: kaynak β kerterizindeyken, enkoder θ'ya bakan antenin gücü ~ P_ref(β - θ). P_ref tepesi
         φ_peak'te olduğundan boresight-çerçevesi P_ref((x + φ_peak) mod 360). Her iki eğri de kendi
@@ -187,29 +191,41 @@ class AntennaPattern:
             # x = boresight'tan açı farkı; ölçüm-çerçevesinde tepe φ_peak(pk)'te -> kaydır
             return np.interp((np.asarray(x_deg) + pk) % 360.0, ang_ext, pref_ext)
 
-        betas = np.arange(0.0, 360.0, 1.0)                    # 1° arama
-        cost = np.empty_like(betas)
-        for k, b in enumerate(betas):
-            resid = pm - pref_bore(b - az)
-            cost[k] = float(np.dot(resid, resid))
+        betas = np.arange(0.0, 360.0, 1.0)                    # 1° arama (tam tur)
+        full_circle = arc_center is None
+        min_cov = MIN_COVERAGE_DEG
+        if not full_circle:
+            # İLERİ-YAY: β adaylarını [merkez±yarı] ile sınırla; kapsama şartını yay genişliğine göre gevşet.
+            d = np.abs(((betas - float(arc_center) + 180.0) % 360.0) - 180.0)
+            betas = betas[d <= float(arc_half)]
+            if len(betas) < 5:
+                return None                                    # yay çok dar / geçersiz
+            min_cov = min(MIN_COVERAGE_DEG, 0.7 * 2.0 * float(arc_half))
+        cost = np.array([float(np.dot(pm - pref_bore(b - az), pm - pref_bore(b - az))) for b in betas])
         kmin = int(np.argmin(cost))
         beta = float(betas[kmin])
         cmin = float(cost[kmin])
 
-        # AMBIGUITY: birincil minimum etrafındaki ±guard penceresini hariç tut, DIŞARIDAKİ en iyi
-        # (ikincil) maliyeti bul. Belirsizlik = ikincil minimumun DERİNLİĞİ / birincilin derinliği
-        # (medyan maliyete göre; ölçek-bağımsız, yönlülüğe yansız).
-        guard = int(round(AMBIGUITY_GUARD_DEG))
-        offs = np.abs(((np.arange(len(betas)) - kmin + len(betas) // 2) % len(betas)) - len(betas) // 2)
-        outside = offs > guard
+        # AMBIGUITY: birincil minimumdan ±guard uzaktaki EN İYİ (ikincil) maliyet. Guard AÇISAL farkla
+        # hesaplanır (hem tam-tur hem yay-alt-kümesi için doğru; yayda arka lob zaten dışarıda kalır).
+        angd = np.abs(((betas - betas[kmin] + 180.0) % 360.0) - 180.0)
+        outside = angd > AMBIGUITY_GUARD_DEG
         second = float(np.min(cost[outside])) if np.any(outside) else float(cost.max())
         # Gürültü-farkında ayrışma z-skoru (büyük=net tek çözüm, küçük=flip riski)
         ambiguity_z = (second / max(cmin, 1e-9) - 1.0) * np.sqrt(n / 2.0)
 
-        # Tepe civarı 3 nokta ile parabol -> hassas β + eğrilik a
-        k0, k1, k2 = (kmin - 1) % len(betas), kmin, (kmin + 1) % len(betas)
-        c0, c1, c2 = cost[k0], cost[k1], cost[k2]
-        a = 0.5 * (c0 + c2 - 2.0 * c1)                        # parabol eğrilik (>0 tepe civarı)
+        # Tepe civarı 3 nokta ile parabol -> hassas β + eğrilik a. Tam-turda kenar SARILIR; yayda
+        # kenardaki minimum için sarmadan kaçın (yanlış komşu almamak için parabolü atla).
+        nb = len(betas)
+        if full_circle:
+            k0, k2 = (kmin - 1) % nb, (kmin + 1) % nb
+        else:
+            k0, k2 = kmin - 1, kmin + 1
+        if 0 <= k0 and k2 < nb:
+            c0, c1, c2 = cost[k0], cost[kmin], cost[k2]
+            a = 0.5 * (c0 + c2 - 2.0 * c1)                    # parabol eğrilik (>0 tepe civarı)
+        else:
+            a = 0.0                                            # yay kenarı -> alt-derece düzeltme yok
         if a > 1e-9:
             delta = 0.5 * (c0 - c2) / (c0 - 2.0 * c1 + c2)    # [-0.5,0.5] alt-derece düzeltme
             beta = (beta + delta) % 360.0
@@ -218,7 +234,7 @@ class AntennaPattern:
             sigma = SIGMA_CEIL_DEG
         sigma = float(np.clip(sigma, SIGMA_FLOOR_DEG, SIGMA_CEIL_DEG))
 
-        quality_ok = ((fb >= MIN_FRONT_BACK_DB) and (cov >= MIN_COVERAGE_DEG)
+        quality_ok = ((fb >= MIN_FRONT_BACK_DB) and (cov >= min_cov)
                       and (ambiguity_z >= MIN_AMBIGUITY_Z) and (a > 1e-9)
                       and (sigma < SIGMA_CEIL_DEG))
         return {
